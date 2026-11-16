@@ -1,13 +1,9 @@
 # Free Claude Code
 
 <p align="center">
-  <img src="docs/images/banner.png" alt="Free Claude Code Banner" width="850">
-</p>
-
-<p align="center">
   **Ace Data Cloud → Free Claude Code**
   <br>
-  An automated tool for connecting newly obtained Ace Data Cloud API keys to your local Free Claude Code installation.
+  An automated tool for connecting Ace Data Cloud API keys to your local Free Claude Code installation.
 </p>
 
 <p align="center">
@@ -17,20 +13,6 @@
 </p>
 
 ---
-
-## Preview
-
-<p align="center">
-  <img src="docs/images/terminal-preview.png" alt="Program running in the terminal" width="850">
-  <br>
-  <em>The program running in PowerShell.</em>
-</p>
-
-<p align="center">
-  <img src="docs/images/admin-panel.png" alt="Free Claude Code admin panel" width="850">
-  <br>
-  <em>New API keys added to the existing provider configuration.</em>
-</p>
 
 ## Features
 
@@ -44,13 +26,9 @@
 | **Provider integration** | Adds keys to the existing Ace Data Cloud provider in Free Claude Code. |
 | **Non-destructive updates** | Adds new key rows without intentionally replacing existing entries. |
 
-## How it works
+## How It Works
 
-<p align="center">
-  <img src="docs/images/workflow.png" alt="Project workflow diagram" width="850">
-</p>
-
-At a high level, the program connects the registration process, email verification, API key capture, and local Free Claude Code configuration into one workflow.
+The program connects the registration process, email verification, API key capture, and local Free Claude Code configuration into one workflow.
 
 ## Requirements
 
