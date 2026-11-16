@@ -2104,7 +2104,7 @@ def explain_fcc_setup():
 
 
 def prompt_fcc_running(context):
-    """Keeps trying the pre-opened admin tab, guiding the user to start FCC. None = skipped."""
+    """Proactively offers to install free-claude-code if it's missing, then guides the user to start it. None = skipped."""
     admin = None
     while True:
         try:
@@ -2112,8 +2112,16 @@ def prompt_fcc_running(context):
             return admin
         except Exception as e:
             ui.err(str(e))
-            answer = ui.ask("Is free-claude-code installed and running? [y/N]")
-            if answer.strip().lower() in ("n", "no"):
+            answer = ui.ask("Do you want to install free-claude-code? [y/N]")
+            if answer.strip().lower() in ("y", "yes"):
+                ui.info("Running free-claude-code installer...")
+                try:
+                    subprocess.run(["powershell", "-Command", FCC_INSTALL_CMD], shell=True)
+                    ui.ok("Installation script finished.")
+                except Exception as ex:
+                    ui.err(f"Installation failed: {ex}")
+                ui.detail('Please open the Windows search bar, type "free-claude-code" and launch it.')
+            else:
                 explain_fcc_setup()
 
             choice = ui.ask("Press Enter to retry once it is running (type 'skip' to carry on without it)")
