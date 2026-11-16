@@ -6,12 +6,6 @@
   An automated tool for connecting Ace Data Cloud API keys to your local Free Claude Code installation.
 </p>
 
-<p align="center">
-  ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
-  ![Platform](https://img.shields.io/badge/Platform-Windows-0078D4?logo=windows&logoColor=white)
-  ![Browser](https://img.shields.io/badge/Browser-Playwright-2EAD33?logo=playwright&logoColor=white)
-</p>
-
 ---
 
 ## Features
