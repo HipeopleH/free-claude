@@ -1,5 +1,5 @@
-  █▀▀ █▀█ █▀▀ █▀▀   █▀▀ █░░ ▄▀█ █░█ █▀▄ █▀▀  
-  █▀░ █▀▄ ██▄ ██▄   █▄▄ █▄▄ █▀█ █▄█ █▄▀ ██▄
+  █▀▀ █▀█ █▀▀ █▀▀      █▀▀ █░░ ▄▀█ █░█ █▀▄ █▀▀  
+  █▀░ █▀▄ ██▄ ██▄      █▄▄ █▄▄ █▀█ █▄█ █▄▀ ██▄
 
 **FREE CLAUDE** is an automated tool for spamming API trial keys to your local Free Claude Code installation with alt accounts.
 
