@@ -1,2 +1,2 @@
 YOUR-LONG(preferably)-GMAIL-EMAIL-HERE@gmail.com
-nonecap=YOUR-NONECAP-API-KEY-HERE
+nonecap=YOUR-NONECAP-API-KEY-HERE.
