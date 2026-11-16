@@ -1,86 +1,116 @@
-# Free Claude Code
+  █▀▀ █▀█ █▀▀ █▀▀   █▀▀ █░░ ▄▀█ █░█ █▀▄ █▀▀  
+  █▀░ █▀▄ ██▄ ██▄   █▄▄ █▄▄ █▀█ █▄█ █▄▀ ██▄
 
-<p align="center">
-  **Ace Data Cloud → Free Claude Code**
-  <br>
-  An automated tool for connecting Ace Data Cloud API keys to your local Free Claude Code installation.
-</p>
+**FREE CLAUDE** is an automated tool for spamming API trial keys to your local Free Claude Code installation with alt accounts.
+
 
 ---
 
 ## Features
 
-| Feature | Description |
-|---|---|
-| **Automated registration** | Handles the Ace Data Cloud registration workflow. |
-| **Email management** | Generates Gmail address variations and tracks account history. |
-| **hCaptcha integration** | Integrates with NoneCap for challenge-token handling. |
+| Feature                       | Description                                                               |
+| ----------------------------- | ------------------------------------------------------------------------- |
+| **Browser automation**        | Uses Playwright and ChromeDriver for browser interaction.                 |
+| **Email management**          | Reads configured email information from `assets.txt`.                     |
 | **Gmail verification bridge** | Receives verification codes through a local HTTP server and Tampermonkey. |
-| **Automatic key capture** | Retrieves newly generated API keys and saves them locally. |
-| **Provider integration** | Adds keys to the existing Ace Data Cloud provider in Free Claude Code. |
-| **Non-destructive updates** | Adds new key rows without intentionally replacing existing entries. |
-
-## How It Works
-
-The program connects the registration process, email verification, API key capture, and local Free Claude Code configuration into one workflow.
+| **API key management**        | Saves API keys locally in `keys.txt`.                                     |
+| **Provider integration**      | Adds keys to the existing trial provider in Free Claude Code.    |
+| **AI generated readme**   | How do you right a readme without spelling errors i was last in spelling bee.      |
 
 ## Requirements
 
 - Windows 10 or Windows 11
 - Python 3.10+
 - Google Chrome
-- Playwright and its Chromium browser
+- Playwright and Chromium
 - ChromeDriver
 - Free Claude Code running locally
-- A configured Tampermonkey Gmail bridge
+- Tampermonkey browser extension
+- A Gmail account
+- A Nonecap API key
 
-## Quick Start
+## Setup
 
-**1. Open the project folder**
+### 1. Download the project
 
-Open PowerShell in the directory containing `coolfile.py`.
+Clone the repository or download its source files.
 
-**2. Run the program**
+Open PowerShell in the project directory.
 
-```powershell
-python coolfile.py
+### 2. Configure `assets.txt`
+
+Create or open `assets.txt` in the project folder.
+
+This file stores the local configuration used by the program.
+- we reccomend creating a long email if yours is shorter then 9 charecters
+- enter your email in the assets.txt file
+- enter your Nonecap API key at https://nonecap.com/#get-started (they accept https://tempmailg.com addresses)
+- you get 1,300 solves per account
+
+### 3. Set up Tampermonkey
+
+1. Install the Tampermonkey extension from the official browser extension store.
+2. Open the Tampermonkey dashboard.
+3. Select **Create a new script**.
+4. Paste the project's Gmail bridge userscript into the editor.
+5. Save the script.
+6. Open Gmail in Chrome.
+7. hit ctrl+shift+r if the script dosent load initially (it has a UI)
+8. keep this tab running in the background.
+
+The userscript communicates with the local verification bridge. Only install scripts you trust, and review their permissions before enabling them.
+
+### 4. Configure NoneCap
+
+How to get a nonecap trial key
+
+1. Open the official NoneCap at https://nonecap.com .
+2. Create an account with https://tempmailg.com as your email address.
+3. Complete the account setup.
+4. Generate an API key through your account dashboard.
+5. Enter it in assets.txt as nonecap= OR nonecapapi=
+
+
+### 5. Start Free Claude Code
+
+Make sure Free Claude Code is running locally and that its admin panel is accessible.
+- If it is not installed api-gen.py will guide you through install steps.
+
+Default address:
+
+```text
+http://localhost:8082/admin
 ```
 
-**3. Follow the terminal**
+### 6. Run the program
 
-The program checks its dependencies, starts its local services, and opens the Free Claude Code admin panel.
+```powershell
+python api-gen.py
+```
 
-**4. Check your configuration**
-
-Confirm that the new key appears in your existing Ace Data Cloud provider configuration.
+The program checks its dependencies, starts its local services, and opens the admin panel.
 
 ## Local Files
 
-| File / Folder | Description |
-|---|---|
-| `coolfile.py` | Main program |
-| `keys.txt` | Stores captured API keys |
-| `accounts.txt` | Stores recent account history |
-| `drivers/` | Browser driver files |
+| File / Folder  | Description             |
+| -------------- | ----------------------- |
+| `api-gen.py`   | Main program            |
+| `assets.txt`   | Local configuration     |
+| `keys.txt`     | Locally stored API keys |
+| `accounts.txt` | Recent account history  |
+| `drivers/`     | Browser driver files    |
 
-## Configuration & Security
+## Ports
 
-- Keep `keys.txt` private.
-- Never upload API keys or account passwords to GitHub.
-- Do not share verification codes or authentication tokens.
-- API availability and credit balances are controlled by Ace Data Cloud.
-- The local bridge should only be accessible to trusted local applications.
+| Port   | Purpose                         |
+| ------ | ------------------------------- |
+| `8080` | Local Gmail verification bridge |
+| `8082` | Free Claude Code admin panel    |
+
 
 ## Credits
 
-- **Ace Data Cloud** — API provider
-- **NoneCap** — CAPTCHA token service integration
+- **NoneCap** — CAPTCHA service
 - **Playwright** — Browser automation
-- **Tampermonkey** — Gmail userscript support
+- **Tampermonkey** — Browser userscript support
 - **Free Claude Code** — Local application integration
-
----
-
-<p align="center">
-  <sub>Built for Free Claude Code.</sub>
-</p>
