@@ -2,7 +2,7 @@
 // @name         gmail localhost free claude thingy
 // @namespace    http://tampermonkey.net/
 // @description  so basically paste this script into tampermonkey and go to gmail.com and then once you are on gmail.com hit ctrl+shift+r wich should hard refresh the page but do this only if the script dosent load
-// @version      9.0
+// @version      9.1
 // @match        https://mail.google.com/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -13,24 +13,40 @@
 (function() {
     'use strict';
 
-    console.log('⚡ Ace Code Bridge: Script loaded v9.0');
+    console.log('⚡ Ace Code Bridge: Script loaded v9.1');
 
     let lastSentCode = "";
     let isProcessing = false;
 
     // --- Create UI Elements ---
+    // Gmail enforces Trusted Types (`require-trusted-types-for 'script'`), so
+    // `element.innerHTML = '...'` throws "This document requires 'TrustedHTML'
+    // assignment" and aborts initUI() before the panel is ever attached. Every
+    // node here is therefore built with createElement/textContent instead.
+    function makeEl(tag, cssText, text) {
+        const node = document.createElement(tag);
+        if (cssText) node.style.cssText = cssText;
+        if (text != null) node.textContent = text;
+        return node;
+    }
+
+    function makeRow(labelText) {
+        const row = makeEl('div', 'display:flex; justify-content:space-between; align-items:center;');
+        row.appendChild(makeEl('span', null, labelText));
+        return row;
+    }
+
     function initUI() {
         // document.body is null at document-start; nothing to attach to yet.
         if (!document.body) return;
 
         const existingUI = document.getElementById('ace-bridge-ui');
-        if (existingUI && document.body.contains(existingUI)) return;
+        if (existingUI) {
+            if (document.body.contains(existingUI)) return;
+            existingUI.remove();
+        }
 
-        if (existingUI) existingUI.remove();
-
-        const container = document.createElement('div');
-        container.id = 'ace-bridge-ui';
-        container.style.cssText = `
+        const container = makeEl('div', `
             position: fixed;
             top: 20px;
             right: 20px;
@@ -45,11 +61,10 @@
             border: 1px solid #45475a;
             overflow: hidden;
             user-select: none;
-        `;
+        `);
+        container.id = 'ace-bridge-ui';
 
-        const header = document.createElement('div');
-        header.id = 'ace-bridge-header';
-        header.style.cssText = `
+        const header = makeEl('div', `
             background: #11111b;
             padding: 8px 12px;
             font-weight: bold;
@@ -58,46 +73,73 @@
             align-items: center;
             cursor: move;
             border-bottom: 1px solid #313244;
-        `;
-        header.innerHTML = `
-            <span>⚡ Ace Code Bridge</span>
-            <div>
-                <button id="ace-ui-min" style="background:none; border:none; color:#a6adc8; cursor:pointer; font-size:14px; padding:0 4px;">−</button>
-            </div>
-        `;
+        `);
+        header.id = 'ace-bridge-header';
+        header.appendChild(makeEl('span', null, '⚡ Ace Code Bridge'));
 
-        const content = document.createElement('div');
+        const headerButtons = makeEl('div');
+        const minBtn = makeEl('button', 'background:none; border:none; color:#a6adc8; cursor:pointer; font-size:14px; padding:0 4px;', '−');
+        minBtn.id = 'ace-ui-min';
+        minBtn.type = 'button';
+        headerButtons.appendChild(minBtn);
+        header.appendChild(headerButtons);
+
+        const content = makeEl('div', 'padding: 12px; display: flex; flex-direction: column; gap: 8px;');
         content.id = 'ace-ui-content';
-        content.style.cssText = `padding: 12px; display: flex; flex-direction: column; gap: 8px;`;
-        content.innerHTML = `
-            <div style="display:flex; justify-content:space-between; align-items:center;">
-                <span>Status:</span>
-                <span id="ace-status" style="color: #f9e2af; font-weight:600;">Listening...</span>
-            </div>
-            <div style="display:flex; justify-content:space-between; align-items:center;">
-                <span>Last Code:</span>
-                <span id="ace-last-code" style="font-family:monospace; font-size:14px; color:#89b4fa; font-weight:bold;">------</span>
-            </div>
-            <div style="display:flex; justify-content:space-between; align-items:center; background:#11111b; padding:6px 8px; border-radius:6px; margin-top:2px;">
-                <span style="font-size:12px;">Inbox Refresh (2s):</span>
-                <label style="position: relative; display: inline-block; width: 34px; height: 18px; cursor: pointer;">
-                    <input type="checkbox" id="ace-refresh-toggle" checked style="opacity: 0; width: 0; height: 0;">
-                    <span id="ace-toggle-slider" style="position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #a6e3a1; transition: .3s; border-radius: 18px;"></span>
-                    <span id="ace-toggle-knob" style="position: absolute; content: ''; height: 14px; width: 14px; left: 18px; bottom: 2px; background-color: #11111b; transition: .3s; border-radius: 50%;"></span>
-                </label>
-            </div>
-            <button id="ace-delete-btn" style="
-                background: #f38ba8;
-                color: #11111b;
-                border: none;
-                padding: 6px 10px;
-                font-weight: bold;
-                border-radius: 6px;
-                cursor: pointer;
-                margin-top: 4px;
-            ">🗑️ Delete ACE Emails</button>
-        `;
 
+        const statusRow = makeRow('Status:');
+        const statusEl = makeEl('span', 'color: #f9e2af; font-weight:600;', 'Listening...');
+        statusEl.id = 'ace-status';
+        statusRow.appendChild(statusEl);
+
+        const codeRow = makeRow('Last Code:');
+        const codeEl = makeEl('span', 'font-family:monospace; font-size:14px; color:#89b4fa; font-weight:bold;', '------');
+        codeEl.id = 'ace-last-code';
+        codeRow.appendChild(codeEl);
+
+        const toggleRow = makeEl('div', `
+            display:flex;
+            justify-content:space-between;
+            align-items:center;
+            background:#11111b;
+            padding:6px 8px;
+            border-radius:6px;
+            margin-top:2px;
+        `);
+        toggleRow.appendChild(makeEl('span', 'font-size:12px;', 'Inbox Refresh (2s):'));
+
+        const toggleLabel = makeEl('label', 'position: relative; display: inline-block; width: 34px; height: 18px; cursor: pointer;');
+        const toggleCheckbox = makeEl('input', 'opacity: 0; width: 0; height: 0;');
+        toggleCheckbox.type = 'checkbox';
+        toggleCheckbox.id = 'ace-refresh-toggle';
+        toggleCheckbox.checked = isInboxRefreshEnabled;
+
+        const slider = makeEl('span', 'position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; transition:.3s; border-radius:18px;');
+        slider.id = 'ace-toggle-slider';
+        const knob = makeEl('span', 'position:absolute; height:14px; width:14px; bottom:2px; background-color:#11111b; transition:.3s; border-radius:50%;');
+        knob.id = 'ace-toggle-knob';
+
+        // Keep the visuals in sync with the real state if the panel is rebuilt.
+        slider.style.backgroundColor = isInboxRefreshEnabled ? '#a6e3a1' : '#45475a';
+        knob.style.left = isInboxRefreshEnabled ? '18px' : '2px';
+
+        toggleLabel.append(toggleCheckbox, slider, knob);
+        toggleRow.appendChild(toggleLabel);
+
+        const deleteBtn = makeEl('button', `
+            background: #f38ba8;
+            color: #11111b;
+            border: none;
+            padding: 6px 10px;
+            font-weight: bold;
+            border-radius: 6px;
+            cursor: pointer;
+            margin-top: 4px;
+        `, '🗑️ Delete ACE Emails');
+        deleteBtn.id = 'ace-delete-btn';
+        deleteBtn.type = 'button';
+
+        content.append(statusRow, codeRow, toggleRow, deleteBtn);
         container.appendChild(header);
         container.appendChild(content);
 
@@ -105,6 +147,17 @@
         targetParent.appendChild(container);
         setupUIEventListeners();
     }
+
+    function safeInitUI() {
+        try {
+            initUI();
+        } catch (err) {
+            console.error('ACE Bridge: initUI failed:', err);
+        }
+    }
+
+    // Recreated panels must not stack duplicate drag listeners on document.
+    let dragBound = false;
 
     function setupUIEventListeners() {
         const minBtn = document.getElementById('ace-ui-min');
@@ -144,20 +197,24 @@
             });
         }
 
-        let isDragging = false, offsetX = 0, offsetY = 0;
-        header.addEventListener('mousedown', (e) => {
-            if (e.target === minBtn) return;
-            isDragging = true;
-            offsetX = e.clientX - container.getBoundingClientRect().left;
-            offsetY = e.clientY - container.getBoundingClientRect().top;
-        });
-        document.addEventListener('mousemove', (e) => {
-            if (!isDragging) return;
-            container.style.left = `${e.clientX - offsetX}px`;
-            container.style.top = `${e.clientY - offsetY}px`;
-            container.style.right = 'auto';
-        });
-        document.addEventListener('mouseup', () => { isDragging = false; });
+        if (!dragBound) {
+            dragBound = true;
+            let isDragging = false, offsetX = 0, offsetY = 0;
+
+            header.addEventListener('mousedown', (e) => {
+                if (e.target === minBtn) return;
+                isDragging = true;
+                offsetX = e.clientX - container.getBoundingClientRect().left;
+                offsetY = e.clientY - container.getBoundingClientRect().top;
+            });
+            document.addEventListener('mousemove', (e) => {
+                if (!isDragging) return;
+                container.style.left = `${e.clientX - offsetX}px`;
+                container.style.top = `${e.clientY - offsetY}px`;
+                container.style.right = 'auto';
+            });
+            document.addEventListener('mouseup', () => { isDragging = false; });
+        }
 
         if (deleteBtnUI) {
             deleteBtnUI.addEventListener('click', () => {
@@ -783,20 +840,20 @@
     }
 
     function startUI() {
-        if (document.body) {
-            initUI();
-        } else {
-            document.addEventListener('DOMContentLoaded', initUI, { once: true });
+        // document-start: body usually doesn't exist yet, but the injection can
+        // also happen after DOMContentLoaded (SPA navigation, cached restore),
+        // so check readyState instead of always waiting for the event.
+        safeInitUI();
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', safeInitUI, { once: true });
         }
-        // Anything that arrives late (SPA re-render, restore from cache) still
-        // gets the UI, but without hammering the DOM on every mutation.
-        window.addEventListener('load', initUI, { once: true });
+        window.addEventListener('load', safeInitUI, { once: true });
     }
 
     startUI();
 
     window.addEventListener('pageshow', (event) => {
-        initUI();
+        safeInitUI();
         startInboxRefresh();
     });
 
@@ -808,9 +865,7 @@
         uiCheckScheduled = true;
         setTimeout(() => {
             uiCheckScheduled = false;
-            if (!document.body) return;
-            const ui = document.getElementById('ace-bridge-ui');
-            if (!ui || !document.body.contains(ui)) initUI();
+            safeInitUI();
         }, 250);
     });
 
