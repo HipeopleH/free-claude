@@ -44,7 +44,7 @@ Create or open `assets.txt` in the project folder.
 This file stores the local configuration used by the program.
 - we reccomend creating a long email if yours is shorter then 9 charecters
 - enter your email in the assets.txt file
-- enter your Nonecap API key at https://nonecap.com/#get-started (they accept https://tempmailg.com addresses)
+- enter your Nonecap API key in assets.txt
 - you get 1,300 solves per account
 
 ### 3. Set up Tampermonkey
