@@ -85,7 +85,7 @@ http://localhost:8082/admin
 ### 6. Run the program
 
 ```powershell
-python api-gen.py
+python api-gen-headless.py
 ```
 
 The program checks its dependencies, starts its local services, and opens the admin panel.
