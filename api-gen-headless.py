@@ -45,8 +45,11 @@ FCC_INSTALL_CMD = (
 PROVIDER_NAME = "ace data cloud"
 PROVIDER_BASE_URL = "https://api.acedata.cloud/v1"
 BRIDGE_PORT = 8080
-MAX_INSTANCES = 10
-START_DELAY = 45          # seconds between browser starts, so Gmail codes never overlap
+MAX_INSTANCES = 100
+MAX_ROUNDS = 99           # back-to-back batches the repeat menu allows
+MIN_START_DELAY = 3       # seconds between browser starts; set per run with the slider
+MAX_START_DELAY = 90
+START_DELAY = 45
 
 # Shared files (accounts.txt / keys.txt) and the shared admin panel are written
 # by every instance, so each of them gets a single lock.
@@ -245,6 +248,24 @@ def banner_art(words=("FREE", "CLAUDE")):
             for row in range(height)]
 
 
+def _stdin_is_tty():
+    """True when keys can be read one at a time (a real console)."""
+    try:
+        return bool(sys.stdin) and sys.stdin.isatty()
+    except Exception:
+        return False
+
+
+def clear_screen():
+    """Puts the next block at the top of a real console (never a pipe)."""
+    try:
+        if not sys.stdout.isatty():
+            return
+    except Exception:
+        return
+    os.system("cls" if os.name == "nt" else "clear")
+
+
 class UI:
     """Live dashboard: a setup checklist plus one colour-coded row per browser."""
 
@@ -257,15 +278,19 @@ class UI:
         self.workers = []
         self.setup_rows = []
         self.count = 1
+        self.round = 1
+        self.rounds = 0
         self.tag_w = 1
         self.started_at = time.time()
         self.started = False
         self.live = LIVE
         self.block_rows = 0
         try:
-            self.cols = max(60, min(shutil.get_terminal_size((100, 24)).columns, 140))
+            size = shutil.get_terminal_size((100, 24))
+            self.cols = max(60, min(size.columns, 140))
+            self.rows = max(12, size.lines)
         except Exception:
-            self.cols = 100
+            self.cols, self.rows = 100, 24
         self.bar_w = 22
 
     # --- geometry ----------------------------------------------------------
@@ -281,7 +306,7 @@ class UI:
         return 12
 
     # --- lifecycle ---------------------------------------------------------
-    def begin(self, count=1, plan=None):
+    def begin(self, count=1, plan=None, round_no=1, rounds=None):
         """Opens the dashboard: one live row per browser instance.
 
         `begin(plan)` keeps the old single-instance call shape.
@@ -291,6 +316,8 @@ class UI:
                 self.count = max(1, min(MAX_INSTANCES, int(count or 1)))
             else:
                 plan, self.count = count, 1
+            self.round = max(1, int(round_no))
+            self.rounds = int(rounds) if rounds else 0
 
             if plan is None:
                 self.plan = [("", 1)]
@@ -601,6 +628,130 @@ class UI:
                 return int(answer)
             self.warn(f"Pick a number from 1 to {total}.")
 
+    def slider(self, title, lines, low, high, value, unit="", hint=""):
+        """Arrow-key slider over whole numbers. Returns the chosen value."""
+        low, high = int(low), int(high)
+        value = int(max(low, min(high, int(value))))
+        if not _stdin_is_tty():
+            return self._slider_typed(title, low, high, value, unit)
+
+        legend = hint or f"left/right 1{unit}   up/down 5{unit}   Enter ok"
+        typed = ""
+        drawn = 0
+        with self.input_lock:
+            try:
+                while True:
+                    shown = int(typed) if typed else value
+                    frame = self._slider_lines(title, lines, low, high, shown,
+                                               unit, legend, typed)
+                    self._erase_lines(drawn)
+                    sys.stdout.write("\n".join(frame))
+                    sys.stdout.flush()
+                    drawn = len(frame)
+
+                    key = self._read_key()
+                    if key in ("left", "right", "up", "down"):
+                        typed = ""
+                        step = 1 if key in ("left", "right") else 5
+                        if key in ("left", "down"):
+                            value = max(low, value - step)
+                        else:
+                            value = min(high, value + step)
+                    elif key == "back":
+                        typed = typed[:-1]
+                    elif key.isdigit():
+                        typed = (typed + key)[-3:]
+                    elif key == "enter":
+                        if typed:
+                            value = max(low, min(high, int(typed)))
+                        break
+                    elif key == "esc":
+                        break
+            finally:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+        return value
+
+    def _slider_typed(self, title, low, high, value, unit):
+        """Fallback for piped input: a plain number prompt."""
+        while True:
+            answer = self.ask(f"{title} ({low}-{high}{unit}, Enter for {value}{unit})")
+            if not answer:
+                return value
+            digits = re.sub(r"\D", "", answer)
+            if digits and low <= int(digits) <= high:
+                return int(digits)
+            self.warn(f"Valid range is {low}-{high}.")
+
+    def _slider_lines(self, title, lines, low, high, value, unit, legend, typed):
+        width = self._width()
+        out = [self._top(title, f"{low}-{high}{unit}", width)]
+        for line in lines:
+            text = _clip(line, width - 3)
+            out.append(self._row([(" ", " "), (text, f"{C.GREY}{text}{C.RESET}")], width))
+        if lines:
+            out.append(self._row([(" ", " ")], width))
+
+        shown = f"{typed}{unit}" if typed else f"{value}{unit}"
+        out.append(self._row([(" ", " "),
+                              (shown, f"{C.WHITE}{C.BOLD}{shown}{C.RESET}")], width))
+
+        lo_lbl, hi_lbl = f"{low}{unit}", f"{high}{unit}"
+        bar = max(12, min(46, width - (len(lo_lbl) + len(hi_lbl) + 8)))
+        pos = 0 if high <= low else int(round((value - low) / (high - low) * (bar - 1)))
+        rail = "\u2500" if UNICODE else "-"
+        knob = "\u25cf" if UNICODE else "|"
+        cap_l = "\u251c" if UNICODE else "["
+        cap_r = "\u2524" if UNICODE else "]"
+        before, after = rail * pos, rail * (bar - pos - 1)
+        plain = f"{lo_lbl} {cap_l}{before}{knob}{after}{cap_r} {hi_lbl}"
+        if COLOR:
+            styled = (f"{C.GREY}{lo_lbl} {C.RESET}{C.LINE}{cap_l}{before}{C.RESET}"
+                      f"{C.CYAN}{C.BOLD}{knob}{C.RESET}"
+                      f"{C.LINE}{after}{cap_r}{C.RESET} {C.GREY}{hi_lbl}{C.RESET}")
+        else:
+            styled = plain
+        out.append(self._row([(" ", " "), (plain, styled)], width))
+        out.append(self._bottom(width))
+        out.append(f"  {C.DIM}{legend}{C.RESET}" if COLOR else f"  {legend}")
+        return out
+
+    def _erase_lines(self, count):
+        """Rewinds `count` lines drawn without a trailing newline."""
+        if count <= 0:
+            return
+        sys.stdout.write("\r\033[2K\033[1A" * (count - 1) + "\r\033[2K")
+
+    def _read_key(self):
+        """One keypress, normalised to left/right/up/down/enter/esc/back/char."""
+        if os.name == "nt":
+            import msvcrt
+            ch = msvcrt.getwch()
+            if ch in ("\x00", "\xe0"):
+                return {"K": "left", "M": "right", "H": "up", "P": "down"}.get(
+                    msvcrt.getwch(), "")
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            return {"\r": "enter", "\n": "enter", "\x1b": "esc",
+                    "\x08": "back", "\x7f": "back"}.get(ch, ch)
+
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            if ch == "\x1b":
+                seq = sys.stdin.read(2)
+                return {"[D": "left", "[C": "right", "[A": "up", "[B": "down"}.get(seq, "esc")
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        return {"\r": "enter", "\n": "enter",
+                "\x7f": "back", "\x08": "back"}.get(ch, ch)
+
     def ask(self, prompt):
         # One prompt at a time, and no worker may redraw the block underneath it.
         with self.input_lock:
@@ -873,7 +1024,24 @@ class UI:
         width = self._width()
         done = sum(1 for w in self.workers if w.status == "done")
         out = [self._top("instances", f"{done} of {len(self.workers)} done", width)]
-        for worker in self.workers:
+        # A hundred rows do not fit on screen, and a block taller than the
+        # terminal cannot be repainted in place. Show the newest rows (the ones
+        # still working) and summarise the rest on one line.
+        room = max(3, getattr(self, "rows", 24) - 16)
+        shown = self.workers
+        if len(self.workers) > room:
+            shown = self.workers[-(room - 1):]
+            hidden = self.workers[:-(room - 1)]
+            parts = [f"{len(hidden)} earlier"]
+            finished = sum(1 for w in hidden if w.status == "done")
+            broken = sum(1 for w in hidden if w.status == "failed")
+            if finished:
+                parts.append(f"{finished} done")
+            if broken:
+                parts.append(f"{broken} failed")
+            note = "  " + ", ".join(parts)
+            out.append(self._row([(" ", " "), (note, f"{C.DIM}{note}{C.RESET}")], width))
+        for worker in shown:
             out.append(self._dash_row(worker, width))
         out.append(self._bottom(width))
         return out
@@ -908,6 +1076,9 @@ class UI:
         else:
             out.append(f"  {BOX['h'] * 2}{label}{BOX['h'] * fill}")
         bits = [f"{self.count} browser" + ("s" if self.count > 1 else "")]
+        if getattr(self, "round", 1) > 1:
+            total = getattr(self, "rounds", 0)
+            bits.append(f"round {self.round} of {total}" if total else f"round {self.round}")
         if self.count > 1:
             bits.append(f"starts {START_DELAY}s apart")
         bits.append(f"keys saved to {os.path.basename(KEYS_FILE)}")
@@ -3406,7 +3577,7 @@ def _worker(index, base_email):
 def ask_instance_count():
     ui.card("how many browsers?", [
         "Each browser earns one API key.",
-        f"Starts are {START_DELAY}s apart to keep Gmail codes separate.",
+        "All of them share this window.",
         f"Enter 1-{MAX_INSTANCES}; Enter alone means 1.",
     ])
     while True:
@@ -3418,69 +3589,136 @@ def ask_instance_count():
         ui.warn(f"Valid range is 1-{MAX_INSTANCES}.")
 
 
+def ask_start_delay():
+    """Slider for the gap between browser starts."""
+    return ui.slider(
+        "start spacing",
+        ["Gap between one browser starting and the next.",
+         "Bigger gaps keep the Gmail codes apart."],
+        MIN_START_DELAY, MAX_START_DELAY, START_DELAY, unit="s",
+    )
+
+
+def set_start_delay(seconds):
+    """Records the spacing this run uses; the banner and the stagger read it."""
+    global START_DELAY
+    START_DELAY = seconds
+
+
+def ask_rounds():
+    """How many batches to run back to back."""
+    choice = ui.menu(
+        "repeat",
+        ["Next batch starts when this one finishes.",
+         "Same count, spacing and email."],
+        [("once", ""),
+         ("keep going", "until Ctrl-C"),
+         ("set a number", f"2-{MAX_ROUNDS}")],
+        default=1,
+    )
+    if choice == 1:
+        return 1
+    if choice == 2:
+        return 0
+    while True:
+        answer = ui.ask(f"Batches (2-{MAX_ROUNDS}):")
+        if answer.isdigit() and 2 <= int(answer) <= MAX_ROUNDS:
+            return int(answer)
+        ui.warn(f"Valid range is 2-{MAX_ROUNDS}.")
+
+
+def run_batches(count, rounds):
+    """Runs one batch after another with the settings of the first."""
+    base_email = None
+    total_done = total_runs = 0
+    round_no = 0
+    while True:
+        round_no += 1
+        ui.begin(count, WORKER_STEPS, round_no, rounds)
+
+        if base_email is None:
+            try:
+                base_email = _bootstrap()
+            except KeyboardInterrupt:
+                ui.finish(False, "Cancelled.")
+                return
+            except Exception as e:
+                _show_traceback()
+                ui.finish(False, f"{e.__class__.__name__}: {e}")
+                return
+
+        if count > 1:
+            ui.info(f"Setup done; launching {count} browsers, {START_DELAY}s apart.")
+        else:
+            ui.info("Setup done; launching the browser.")
+
+        threads = []
+        interrupted = False
+        launched_at = time.time()
+        try:
+            for index in range(count):
+                if index:
+                    target = launched_at + index * START_DELAY
+                    while time.time() < target:
+                        ui.queue_note(index, f"starts in {int(round(target - time.time()))}s")
+                        time.sleep(min(0.5, max(0.02, target - time.time())))
+                    ui.queue_note(index, "starting now")
+                ui.worker_start(index)
+                thread = threading.Thread(
+                    target=_worker,
+                    args=(index, base_email),
+                    name=f"ace-{index + 1}",
+                    daemon=True,
+                )
+                thread.start()
+                threads.append(thread)
+        except KeyboardInterrupt:
+            ui.skip_queued()
+            ui.warn("Stopped launching new instances.")
+
+        try:
+            for thread in threads:
+                # A plain join() would swallow Ctrl-C until every browser finished.
+                while thread.is_alive():
+                    thread.join(0.4)
+        except KeyboardInterrupt:
+            interrupted = True
+            ui.warn("Running instances left in the background.")
+
+        done = [w for w in ui.workers if w.status == "done"]
+        failed = [w for w in ui.workers if w.status == "failed"]
+        if threads and done and not failed and len(done) == len(threads):
+            message = f"{len(done)} of {len(threads)} instances produced a key."
+            success = True
+        elif done:
+            message = f"{len(done)} of {max(len(threads), 1)} instances produced a key."
+            success = False
+        else:
+            message = "No keys were produced."
+            success = False
+        total_done += len(done)
+        total_runs += len(threads)
+        ui.finish(success, message)
+
+        if interrupted or (rounds and round_no >= rounds):
+            break
+
+    if round_no > 1:
+        ui.info(f"{total_done} of {total_runs} instances produced a key "
+                f"over {round_no} batches.")
+
+
 def main():
+    clear_screen()
     count = ask_instance_count()
-    ui.begin(count, WORKER_STEPS)
-
-    try:
-        base_email = _bootstrap()
-    except KeyboardInterrupt:
-        ui.finish(False, "Cancelled.")
-        return
-    except Exception as e:
-        _show_traceback()
-        ui.finish(False, f"{e.__class__.__name__}: {e}")
-        return
-
     if count > 1:
-        ui.info(f"Setup done; launching {count} browsers, {START_DELAY}s apart.")
-    else:
-        ui.info("Setup done; launching the browser.")
-
-    threads = []
-    launched_at = time.time()
-    try:
-        for index in range(count):
-            if index:
-                target = launched_at + index * START_DELAY
-                while time.time() < target:
-                    ui.queue_note(index, f"starts in {int(round(target - time.time()))}s")
-                    time.sleep(min(0.5, max(0.02, target - time.time())))
-                ui.queue_note(index, "starting now")
-            ui.worker_start(index)
-            thread = threading.Thread(
-                target=_worker,
-                args=(index, base_email),
-                name=f"ace-{index + 1}",
-                daemon=True,
-            )
-            thread.start()
-            threads.append(thread)
-    except KeyboardInterrupt:
-        ui.skip_queued()
-        ui.warn("Stopped launching new instances.")
-
-    try:
-        for thread in threads:
-            # A plain join() would swallow Ctrl-C until every browser finished.
-            while thread.is_alive():
-                thread.join(0.4)
-    except KeyboardInterrupt:
-        ui.warn("Running instances left in the background.")
-
-    done = [w for w in ui.workers if w.status == "done"]
-    failed = [w for w in ui.workers if w.status == "failed"]
-    if threads and done and not failed and len(done) == len(threads):
-        message = f"{len(done)} of {len(threads)} instances produced a key."
-        success = True
-    elif done:
-        message = f"{len(done)} of {max(len(threads), 1)} instances produced a key."
-        success = False
-    else:
-        message = "No keys were produced."
-        success = False
-    ui.finish(success, message)
-
+        set_start_delay(ask_start_delay())
+    rounds = ask_rounds()
+    clear_screen()
+    run_batches(count, rounds)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nCancelled.")
