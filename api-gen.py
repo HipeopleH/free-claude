@@ -4,6 +4,7 @@ import itertools
 import json
 import os
 import platform
+import queue
 import random
 import re
 import shutil
@@ -40,6 +41,13 @@ FCC_INSTALL_CMD = (
 PROVIDER_NAME = "ace data cloud"
 PROVIDER_BASE_URL = "https://api.acedata.cloud/v1"
 BRIDGE_PORT = 8080
+MAX_INSTANCES = 10
+START_DELAY = 45          # seconds between browser starts, so Gmail codes never overlap
+
+# Shared files (accounts.txt / keys.txt) and the shared admin panel are written
+# by every instance, so each of them gets a single lock.
+FILE_LOCK = threading.RLock()
+FCC_LOCK = threading.RLock()
 
 # Run plan: every step advances the bar, weighted by how long it really takes.
 STEPS = (
@@ -65,6 +73,9 @@ STEPS = (
 )
 TOTAL_STEPS = len(STEPS)
 STEP_WEIGHT = dict(STEPS)
+
+# Setup runs once; everything after it runs inside every instance.
+WORKER_STEPS = tuple((title, weight) for title, weight in STEPS[3:])
 
 # --- Terminal UI ---
 def _enable_windows_ansi():
@@ -103,7 +114,8 @@ def _encodable(text):
         return False
 
 
-_GLYPHS = "\u2588\u2591\u25b8\u2714\u2716\u203a\u2022\u2026\u2192\u2500\u2584\u2580"
+_GLYPHS = ("\u2588\u2591\u25b8\u2714\u2716\u203a\u2022\u2026\u2192\u2500\u2502"
+           "\u250c\u2510\u2514\u2518\u25cf\u25cb\u25b6\u21b3\u2584\u2580\u280b")
 if not _encodable(_GLYPHS):
     _console_utf8()
 if not _encodable(_GLYPHS):
@@ -127,12 +139,22 @@ if UNICODE:
     BAR_FULL, BAR_EMPTY = "\u2588", "\u2591"
     S_OK, S_ERR = "\u2714", "\u2716"
     S_WARN, S_INFO, S_NOTE, S_ARROW, S_ELL = "!", "\u203a", "\u2022", "\u25b8", "\u2026"
+    S_DOT, S_RING, S_PLAY, S_HINT = "\u25cf", "\u25cb", "\u25b6", "\u21b3"
+    SPIN = ("\u280b", "\u2819", "\u2839", "\u2838", "\u283c",
+            "\u2834", "\u2826", "\u2827", "\u2807", "\u280f")
+    BOX = {"tl": "\u250c", "tr": "\u2510", "bl": "\u2514", "br": "\u2518",
+           "h": "\u2500", "v": "\u2502"}
 else:
     BAR_FULL, BAR_EMPTY = "#", "-"
     S_OK, S_ERR, S_WARN, S_INFO, S_NOTE, S_ARROW, S_ELL = "OK", "X", "!", ">", "*", ">", "..."
+    S_DOT, S_RING, S_PLAY, S_HINT = "@", "o", ">", "->"
+    SPIN = ("|", "/", "-", "\\")
+    BOX = {"tl": "+", "tr": "+", "bl": "+", "br": "+", "h": "-", "v": "|"}
 
-# Width of the banner art ("FREE CLAUDE" in half-block letters).
-RULE_W = 41
+RULE_W = 56
+
+# One accent colour per instance, so a row is recognisable at a glance.
+ACCENTS = (45, 213, 220, 84, 208, 111, 141, 156, 203, 51)
 
 class C:
     RESET = "\033[0m" if COLOR else ""
@@ -146,6 +168,22 @@ class C:
     RED = "\033[38;5;203m" if COLOR else ""
     GREY = "\033[38;5;244m" if COLOR else ""
     WHITE = "\033[38;5;255m" if COLOR else ""
+    LINE = "\033[38;5;240m" if COLOR else ""
+
+def accent(code):
+    """The colour that belongs to one instance."""
+    return f"\033[38;5;{code}m" if COLOR else ""
+
+def _clip(text, width):
+    """Shortens plain text with an ellipsis so a row can never wrap."""
+    text = text or ""
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width <= len(S_ELL):
+        return text[:width]
+    return text[:width - len(S_ELL)] + S_ELL
 
 def _fmt_duration(seconds):
     seconds = max(0, int(seconds))
@@ -155,75 +193,269 @@ def _fmt_duration(seconds):
 def mask_key(key):
     return key if len(key) <= 12 else f"{key[:4]}{S_ELL}{key[-4:]}"
 
+class WorkerRow:
+    """One browser instance: its live step, its colour and how it ended."""
+
+    def __init__(self, number, accent_code=45):
+        self.number = number
+        self.accent = accent_code      # 256-colour code that identifies this instance
+        self.status = "queued"        # queued | working | done | failed | cancelled
+        self.done = 0
+        self.total = 1
+        self.weight_done = 0
+        self.fill = 0.0
+        self.title = "queued"
+        self.note = ""
+        self.started_at = None
+        self.finished_at = None
+        self.email = ""
+        self.key = ""
+        self.message = ""
+
+    def elapsed(self):
+        if self.started_at is None:
+            return 0.0
+        return (self.finished_at or time.time()) - self.started_at
+
+
 class UI:
+    """Live dashboard: a setup checklist plus one colour-coded row per browser."""
+
     def __init__(self):
         self.lock = threading.RLock()
+        self.input_lock = threading.Lock()
+        self._tls = threading.local()
         self.plan = [("", 1)]
-        self.total = 1
         self.total_weight = 1
-        self.done_weight = 0
-        self.index = 0
-        self.fill = 0.0
-        self.title = ""
-        self.note = ""
+        self.workers = []
+        self.setup_rows = []
+        self.count = 1
+        self.tag_w = 1
         self.started_at = time.time()
         self.started = False
         self.live = LIVE
+        self.block_rows = 0
         try:
             self.cols = max(60, min(shutil.get_terminal_size((100, 24)).columns, 140))
         except Exception:
             self.cols = 100
-        self.bar_w = 26 if self.cols >= 90 else 20
+        self.bar_w = 22
 
-    def begin(self, plan=None):
+    # --- geometry ----------------------------------------------------------
+    def _width(self):
+        return max(44, min(getattr(self, "cols", 100) - 4, 92))
+
+    def _bar_w(self):
+        width = self._width()
+        if width >= 80:
+            return 22
+        if width >= 68:
+            return 16
+        return 12
+
+    # --- lifecycle ---------------------------------------------------------
+    def begin(self, count=1, plan=None):
+        """Opens the dashboard: one live row per browser instance.
+
+        `begin(plan)` keeps the old single-instance call shape.
+        """
         with self.lock:
-            if plan is None or isinstance(plan, int):
-                self.plan = [("", 1)] * max(1, int(plan or 1))
+            if isinstance(count, int) or count is None:
+                self.count = max(1, min(MAX_INSTANCES, int(count or 1)))
+            else:
+                plan, self.count = count, 1
+
+            if plan is None:
+                self.plan = [("", 1)]
             else:
                 self.plan = [(str(t), max(1, int(w))) for t, w in plan] or [("", 1)]
-            self.total = len(self.plan)
             self.total_weight = sum(w for _, w in self.plan) or 1
-            self.index = 0
-            self.done_weight = 0
-            self.fill = 0.0
-            self.title = "Starting"
-            self.note = ""
-            self.started_at = time.time()
+
+            self.tag_w = max(1, len(str(self.count)))
+            self.workers = [
+                WorkerRow(i + 1, ACCENTS[i % len(ACCENTS)]) for i in range(self.count)
+            ]
+            for worker in self.workers:
+                worker.total = len(self.plan)
+
             self.started = True
+            self.started_at = time.time()
+            self.block_rows = 0
             self._banner()
-            self._draw()
+            self._paint()
+
+    def bind(self, index):
+        """Points this thread's steps and log lines at one instance."""
+        self._tls.index = None if index is None else int(index)
+
+    def bound(self):
+        return getattr(self._tls, "index", None)
+
+    def worker(self, index):
+        with self.lock:
+            if 0 <= index < len(self.workers):
+                return self.workers[index]
+            return None
+
+    def worker_start(self, index):
+        with self.lock:
+            worker = self.worker(index)
+            if worker is None:
+                return
+            worker.status = "working"
+            worker.started_at = time.time()
+            worker.title = "Starting the browser"
+            worker.note = ""
+            self._paint()
+
+    def worker_done(self, index, ok, message=""):
+        with self.lock:
+            worker = self.worker(index)
+            if worker is None:
+                return
+            worker.status = "done" if ok else "failed"
+            worker.finished_at = time.time()
+            worker.message = message or ""
+            worker.note = ""
+            if ok:
+                worker.fill = 1.0
+                worker.done = worker.total
+                worker.weight_done = self.total_weight
+            self._paint()
+
+    def worker_email(self, index, email):
+        with self.lock:
+            worker = self.worker(index)
+            if worker is not None:
+                worker.email = email or ""
+                self._paint()
+
+    def worker_key(self, index, key):
+        with self.lock:
+            worker = self.worker(index)
+            if worker is not None:
+                worker.key = key or ""
+                self._paint()
+
+    def queue_note(self, index, text):
+        with self.lock:
+            worker = self.worker(index)
+            if worker is not None and worker.status == "queued":
+                worker.note = text or ""
+                self._paint()
+
+    def skip_queued(self):
+        with self.lock:
+            for worker in self.workers:
+                if worker.status == "queued":
+                    worker.status = "cancelled"
+                    worker.note = ""
+            self._paint()
+
+    # --- setup checklist ---------------------------------------------------
+    def setup_begin(self, items):
+        with self.lock:
+            self.setup_rows = [
+                {"label": label, "state": "pending", "detail": detail or "waiting", "hint": ""}
+                for label, detail in items
+            ]
+            if not self.live:
+                print("  -- setup ------------------------------", flush=True)
+                return
+            self._paint()
+
+    def setup_item(self, label, state, detail="", hint=""):
+        """Moves one checklist row between pending / busy / ok / warn / fail."""
+        with self.lock:
+            item = next((i for i in self.setup_rows if i["label"] == label), None)
+            if item is None:
+                item = {"label": label, "state": "pending", "detail": "", "hint": ""}
+                self.setup_rows.append(item)
+            item["state"] = state
+            if detail:
+                item["detail"] = detail
+            item["hint"] = hint or ""
+
+            if not self.live:
+                if state == "fail":
+                    print(f"  [XX] {label}  {item['detail']}", flush=True)
+                    if hint:
+                        print(f"       {hint}", flush=True)
+                elif state == "warn":
+                    print(f"  [!!] {label}  {item['detail']}", flush=True)
+                elif state == "ok":
+                    print(f"  [OK] {label}  {item['detail']}", flush=True)
+                return
+            self._paint()
+
+    def setup_end(self):
+        with self.lock:
+            if self.live and self.started and self.setup_rows:
+                # Leave the finished checklist in the scrollback, then keep only
+                # the dashboard live so the screen does not keep growing.
+                frozen = self._setup_lines()
+                self._erase()
+                for line in frozen:
+                    print(line, flush=True)
+                self.setup_rows = []
+                self._paint()
+                return
+            self.setup_rows = []
+            self._paint()
+
+    # --- progress ----------------------------------------------------------
+    def _current(self):
+        index = getattr(self._tls, "index", None)
+        if index is None or not (0 <= index < len(self.workers)):
+            return None
+        return self.workers[index]
 
     def step(self, title):
         with self.lock:
+            worker = self._current()
+            if worker is None:
+                if self.started:
+                    self._print(f"      {title}")
+                return
             if not self.started:
                 return
+
             weight = 1
-            for i in range(self.index, len(self.plan)):
+            for i in range(worker.done, len(self.plan)):
                 if self.plan[i][0] == title:
                     weight = self.plan[i][1]
                     break
-            self.index = min(self.total, self.index + 1)
-            self.done_weight = min(self.total_weight, self.done_weight + weight)
-            self.title = title
-            self.note = ""
-            target = self.done_weight / self.total_weight
+            worker.done = min(worker.total, worker.done + 1)
+            worker.weight_done = min(self.total_weight, worker.weight_done + weight)
+            worker.title = title
+            worker.note = ""
+            target = worker.weight_done / self.total_weight
+
             if not self.live:
-                self.fill = target
-                print(self._line(target), flush=True)
+                worker.fill = target
+                pct = int(round(target * 100))
+                print(f"  #{worker.number:02d}  {worker.done:02d}/{worker.total:02d}  "
+                      f"{pct:3d}%  {title}", flush=True)
                 return
-            start = self.fill
-            for k in range(1, 11):
-                self.fill = start + (target - start) * (k / 10.0)
-                self._draw()
-                time.sleep(0.008)
-            self.fill = target
-            self._draw()
+
+            start = worker.fill
+            frames = 5 if self.count == 1 else 3
+            for k in range(1, frames + 1):
+                worker.fill = start + (target - start) * (k / float(frames))
+                self._paint()
+                time.sleep(0.006)
+            worker.fill = target
+            self._paint()
 
     def set_note(self, text):
         with self.lock:
-            self.note = text or ""
-            self._draw()
+            worker = self._current()
+            if worker is None:
+                return
+            worker.note = text or ""
+            self._paint()
 
+    # --- log lines ---------------------------------------------------------
     def ok(self, msg):
         self._icon(S_OK, C.GREEN, msg)
 
@@ -241,7 +473,6 @@ class UI:
             self._print(f"      {C.DIM}{msg}{C.RESET}" if COLOR else f"      {msg}")
 
     def cmd(self, text):
-        """Prints a command the user should copy, on its own highlighted line."""
         with self.lock:
             if COLOR:
                 self._print(f"        {C.CYAN}{C.BOLD}{text}{C.RESET}")
@@ -253,11 +484,14 @@ class UI:
             self._print("")
 
     def key(self, value, title="API KEY", note=""):
-        """Prints a captured secret in a box so it can be read straight off the terminal."""
         value = (value or "").strip()
         if not value:
             return
         with self.lock:
+            worker = self._current()
+            accent_code = worker.accent if worker else None
+            if worker is not None:
+                title = f"{title}  {S_NOTE}  #{worker.number:0{self.tag_w}d}"
             room = max(16, self.cols - 6)
             chunks = [value[i:i + room] for i in range(0, len(value), room)]
             inner = max(len(c) for c in chunks) + 2
@@ -272,147 +506,403 @@ class UI:
                 bottom = "+" + "-" * inner + "+"
                 bar = "|"
 
-            if COLOR:
-                frame = f"{C.PURPLE}{top}{C.RESET}"
-            else:
-                frame = top
-            self._print(f"  {frame}")
+            frame = accent(accent_code) if (COLOR and accent_code) else C.PURPLE
+            self._print(f"  {frame}{top}{C.RESET}")
 
             for chunk in chunks:
                 pad = " " * (inner - len(chunk) - 2)
                 if COLOR:
-                    self._print(f"  {C.PURPLE}{bar}{C.RESET} {C.GREEN}{C.BOLD}{chunk}{C.RESET}{pad} "
-                                f"{C.PURPLE}{bar}{C.RESET}")
+                    self._print(f"  {frame}{bar}{C.RESET} {C.GREEN}{C.BOLD}{chunk}{C.RESET}{pad} "
+                                f"{frame}{bar}{C.RESET}")
                 else:
                     self._print(f"  {bar} {chunk}{pad} {bar}")
 
-            self._print(f"  {C.PURPLE}{bottom}{C.RESET}" if COLOR else f"  {bottom}")
+            self._print(f"  {frame}{bottom}{C.RESET}" if COLOR else f"  {bottom}")
             if note:
                 self.detail(note)
 
+    # --- prompts and static cards -----------------------------------------
+    def card(self, title, lines):
+        """A static framed hint box that stays in the scrollback."""
+        with self.lock:
+            width = self._width()
+            out = [self._top(title, "", width)]
+            for line in lines:
+                text = _clip(line, width - 3)
+                out.append(self._row([(" ", " "), (text, f"{C.GREY}{text}{C.RESET}")], width))
+            out.append(self._bottom(width))
+            self._print_lines(out)
+
     def ask(self, prompt):
-        with self.lock:
-            self._clear()
-        answer = input(f"  {C.PURPLE}?{C.RESET}  {prompt} " if COLOR else f"  ?  {prompt} ")
-        with self.lock:
-            if self.started:
-                self._draw()
+        # One prompt at a time, and no worker may redraw the block underneath it.
+        with self.input_lock:
+            with self.lock:
+                self._erase()
+                if COLOR:
+                    sys.stdout.write(f"  {C.PURPLE}{C.BOLD}?{C.RESET}  {C.WHITE}{prompt}{C.RESET}  ")
+                else:
+                    sys.stdout.write(f"  ?  {prompt}  ")
+                sys.stdout.flush()
+                try:
+                    answer = input()
+                except EOFError:
+                    answer = ""
+                if self.started:
+                    self._paint()
         return answer.strip()
 
     def phase(self, title):
         with self.lock:
             pad = max(0, RULE_W - 4 - len(title))
             if COLOR:
-                line = f"  {C.PURPLE}\u2500\u2500 {title} " + "\u2500" * pad + C.RESET
+                line = (f"  {C.PURPLE}{C.BOLD}{title.lower()}{C.RESET} "
+                        f"{C.LINE}{BOX['h'] * pad}{C.RESET}")
             else:
                 line = f"  -- {title} " + "-" * pad
             self._print(line)
 
     def stop(self):
         with self.lock:
-            self.started = False
-            self._clear()
+            self._erase()
 
     def finish(self, success, message=""):
         with self.lock:
+            self._erase()
             self.started = False
-            self._clear()
+            self.setup_rows = []
             elapsed = _fmt_duration(time.time() - self.started_at)
-            rule = "\u2500" * RULE_W if UNICODE else "-" * RULE_W
+            width = self._width()
+            done = [w for w in self.workers if w.status == "done"]
+
             if success:
-                head = f"{C.GREEN}{S_OK}{C.RESET}  COMPLETE" if COLOR else f"[{S_OK}]  COMPLETE"
+                mark, mcol, verdict = S_OK, C.GREEN, "COMPLETE"
+            elif done:
+                mark, mcol, verdict = S_WARN, C.YELLOW, "PARTIAL"
             else:
-                head = f"{C.RED}{S_ERR}{C.RESET}  STOPPED" if COLOR else f"[{S_ERR}]  STOPPED"
-            print()
-            print(f"  {C.PURPLE}{rule}{C.RESET}" if COLOR else f"  {rule}")
+                mark, mcol, verdict = S_ERR, C.RED, "STOPPED"
+
+            out = [""]
+            right = f"{len(done)} of {len(self.workers)} saved"
+            out.append(self._top("results", right, width))
+            for worker in self.workers:
+                out.append(self._result_row(worker, width))
+            out.append(self._bottom(width))
+
             if COLOR:
-                print(f"  {head}   {C.DIM}\u00b7{C.RESET}  {C.BOLD}{elapsed}{C.RESET}")
+                out.append(f"  {mcol}{C.BOLD}{mark}  {verdict}{C.RESET}"
+                           f"   {C.DIM}{elapsed}{C.RESET}")
             else:
-                print(f"  {head}   -  {elapsed}")
+                out.append(f"  [{mark}]  {verdict}   -  {elapsed}")
             if message:
-                print(f"     {C.DIM}{message}{C.RESET}" if COLOR else f"     {message}")
-            print(f"  {C.PURPLE}{rule}{C.RESET}" if COLOR else f"  {rule}")
-            print()
+                out.append(f"  {C.GREY}{message}{C.RESET}" if COLOR else f"  {message}")
+            if done:
+                tail = (f"keys appended to {os.path.basename(KEYS_FILE)}"
+                        f"  {S_NOTE}  accounts keep the last {ACCOUNT_HISTORY}")
+                out.append(f"  {C.DIM}{tail}{C.RESET}" if COLOR else f"  {tail}")
+            out.append("")
+            self._print_lines(out)
 
-    def _banner(self):
-        if UNICODE:
-            print()
-            print(f"{C.CYAN}  █▀▀ █▀█ █▀▀ █▀▀   █▀▀ █░░ ▄▀█ █░█ █▀▄ █▀▀{C.RESET}")
-            print(f"{C.BLUE}  █▀░ █▀▄ ██▄ ██▄   █▄▄ █▄▄ █▀█ █▄█ █▄▀ ██▄{C.RESET}")
-            print(f"{C.PURPLE}  " + "\u2500" * RULE_W + C.RESET)
+    # --- row rendering -----------------------------------------------------
+    def _result_row(self, worker, width):
+        tag = f"#{worker.number:0{self.tag_w}d}"
+        chip_plain = f" {tag} "
+        chip_styled = self._chip(worker.number, worker.accent)
+        time_w = 8
 
-            left, right = "Ace Data Cloud", "free-claude-code"
-            arrow = "\u2192"
-            slack = RULE_W - len(left) - len(right) - len(arrow)
-            pad_l = max(1, slack // 2)
-            pad_r = max(1, slack - pad_l)
-            print(f"  {C.DIM}{left}{C.RESET}{' ' * pad_l}{C.PURPLE}{arrow}{C.RESET}"
-                  f"{' ' * pad_r}{C.GREY}{right}{C.RESET}")
-            print()
+        if worker.status == "done":
+            mark, mcol = S_OK, C.GREEN
+            tail, tcol = worker.key or "key captured", C.GREEN
+            took = _fmt_duration(worker.elapsed())
+        elif worker.status == "failed":
+            mark, mcol = S_ERR, C.RED
+            tail, tcol = worker.message or "failed", C.RED
+            took = _fmt_duration(worker.elapsed())
+        elif worker.status == "cancelled":
+            mark, mcol = S_WARN, C.YELLOW
+            tail, tcol = "cancelled", C.YELLOW
+            took = "-"
+        elif worker.status == "working":
+            mark, mcol = S_DOT, C.YELLOW
+            tail, tcol = "still running", C.YELLOW
+            took = _fmt_duration(worker.elapsed())
         else:
-            left, right = "Ace Data Cloud", "free-claude-code"
-            arrow = "->"
-            slack = RULE_W - len(left) - len(right) - len(arrow)
-            pad_l = max(1, slack // 2)
-            pad_r = max(1, slack - pad_l)
-            print()
-            print("  FREE CLAUDE")
-            print("  " + "-" * RULE_W)
-            print(f"  {left}{' ' * pad_l}{arrow}{' ' * pad_r}{right}")
-            print()
+            mark, mcol = S_RING, C.GREY
+            tail, tcol = "never started", C.GREY
+            took = "-"
 
-    def _line(self, fill):
-        fill = max(0.0, min(1.0, fill))
-        filled = int(round(self.bar_w * fill))
-        pct = int(round(fill * 100))
-        counter = f"{self.index:02d}/{self.total:02d}"
-        prefix = f"  {S_ARROW} {counter}  "
-        mid = f"  {pct:3d}%  "
-        room = self.cols - len(prefix) - self.bar_w - len(mid) - 1
-        title = self.title
-        if len(title) > room:
-            title = title[:max(8, room)]
+        lead = 1 + 1 + 1 + len(chip_plain) + 2 + time_w + 2
+        room = max(8, width - lead - 1)
+        tail = _clip(tail, room)
+        took = f"{_clip(took, time_w):>{time_w}}"
+        return self._row([
+            (" ", " "),
+            (mark, f"{mcol}{mark}{C.RESET}"),
+            (" ", " "),
+            (chip_plain, chip_styled),
+            ("  ", "  "),
+            (took, f"{C.DIM}{took}{C.RESET}"),
+            ("  ", "  "),
+            (tail, f"{tcol}{tail}{C.RESET}"),
+            (" ", " "),
+        ], width)
 
-        # Keep the step title intact and squeeze the note into whatever is left.
-        note_plain = ""
-        if self.note:
-            avail = room - len(title) - 3
-            if avail > 8:
-                if len(self.note) <= avail:
-                    text = self.note
-                else:
-                    text = self.note[:max(1, avail - len(S_ELL))] + S_ELL
-                note_plain = "   " + text
-        note = f"{C.DIM}{note_plain}{C.RESET}" if note_plain else ""
+    def _dash_row(self, worker, width):
+        tag = f"#{worker.number:0{self.tag_w}d}"
+        chip_plain = f" {tag} "
+        chip_styled = self._chip(worker.number, worker.accent)
+        bar_w = self._bar_w()
+        pct_w = 4
+        right_w = 8
+        acc = accent(worker.accent)
+        elapsed = _fmt_duration(worker.elapsed())
+        title = note = ""
+        tcol = ncol = C.WHITE
+        right = ""
+        fill = worker.fill
+        bcol = acc
+
+        if worker.status == "queued":
+            mark, mcol = S_RING, C.GREY
+            fill, bcol, pcol = 0.0, C.LINE, C.GREY
+            title, tcol = worker.note or "waiting for a slot", C.GREY
+        elif worker.status == "done":
+            mark, mcol = S_OK, C.GREEN
+            fill, bcol, pcol = 1.0, C.GREEN, C.GREEN
+            title, tcol = "key saved", C.GREEN
+            note, ncol = mask_key(worker.key), C.DIM
+            right = elapsed
+        elif worker.status == "failed":
+            mark, mcol = S_ERR, C.RED
+            fill, bcol, pcol = worker.fill, C.RED, C.RED
+            title, tcol = worker.message or "failed", C.RED
+            right = elapsed
+        elif worker.status == "cancelled":
+            mark, mcol = S_WARN, C.YELLOW
+            fill, bcol, pcol = 0.0, C.LINE, C.YELLOW
+            title, tcol = "cancelled", C.YELLOW
+        else:
+            mark, mcol = S_DOT, acc
+            pcol = C.WHITE
+            title, tcol = worker.title or "", C.WHITE
+            note, ncol = worker.note or "", C.DIM
+            right = elapsed
+
+        # " mark " chip " bar " pct "  " middle right "  -> 12 + chip + bar + right
+        fixed = 3 + len(chip_plain) + 1 + bar_w + 1 + pct_w + 2 + right_w + 1
+        room = max(6, width - fixed)
+
+        title = _clip(title, room)
+        if note:
+            note = _clip(note, max(0, room - len(title) - 2))
+        mid_plain = title + (("  " + note) if note else "")
+        mid_plain += " " * max(0, room - len(mid_plain))
+        mid_styled = f"{tcol}{title}{C.RESET}"
+        if note:
+            mid_styled += "  " + f"{ncol}{note}{C.RESET}"
+        mid_styled += " " * max(0, room - len(title) - (len(note) + 2 if note else 0))
+
+        pos = int(round(bar_w * max(0.0, min(1.0, fill))))
+        bar_plain = BAR_FULL * pos + BAR_EMPTY * (bar_w - pos)
+        bar_styled = f"{bcol}{BAR_FULL * pos}{C.LINE}{BAR_EMPTY * (bar_w - pos)}{C.RESET}"
+        pct = int(round(100 * max(0.0, min(1.0, fill))))
+        pct_plain = f"{pct:3d}%"
+        right_plain = f"{_clip(right, right_w):>{right_w}}"
+
+        return self._row([
+            (" ", " "),
+            (mark, f"{mcol}{mark}{C.RESET}"),
+            (" ", " "),
+            (chip_plain, chip_styled),
+            (" ", " "),
+            (bar_plain, bar_styled),
+            (" ", " "),
+            (pct_plain, f"{pcol}{pct_plain}{C.RESET}"),
+            ("  ", "  "),
+            (mid_plain, mid_styled),
+            (right_plain, f"{C.DIM}{right_plain}{C.RESET}"),
+            (" ", " "),
+        ], width)
+
+    def _row_line(self, worker):
+        """The row for one instance, already fitted to the terminal width."""
+        return self._dash_row(worker, self._width())
+
+    # --- boxes -------------------------------------------------------------
+    def _row(self, segs, width):
+        plain = "".join(p for p, _ in segs)
+        styled = "".join(s for _, s in segs)
+        if len(plain) > width:
+            plain = plain[:width]
+            styled = plain
+        styled += " " * max(0, width - len(plain))
         if COLOR:
-            bar = C.CYAN + BAR_FULL * filled + C.GREY + BAR_EMPTY * (self.bar_w - filled) + C.RESET
-            return (f"  {C.PURPLE}{S_ARROW}{C.RESET} {C.GREY}{counter}{C.RESET}  "
-                    f"{bar}  {C.BOLD}{pct:3d}%{C.RESET}  {C.WHITE}{title}{C.RESET}{note}")
-        bar = BAR_FULL * filled + BAR_EMPTY * (self.bar_w - filled)
-        return f"  {S_ARROW} {counter}  {bar}  {pct:3d}%  {title}{note_plain}"
+            return f"  {C.LINE}{BOX['v']}{C.RESET}{styled}{C.LINE}{BOX['v']}{C.RESET}"
+        return f"  {BOX['v']}{styled}{BOX['v']}"
 
-    def _clear(self):
-        if self.live:
-            sys.stdout.write("\r\033[2K")
-            sys.stdout.flush()
+    def _top(self, title, right, width):
+        h = BOX["h"]
+        title = _clip(title, max(3, width // 3))
+        right = _clip(right or "", max(0, width - len(title) - 9))
+        left_txt = f"{h} {title} "
+        right_txt = f" {right} " if right else ""
+        fill = width - len(left_txt) - len(right_txt)
+        if fill < 1:
+            right_txt = ""
+            fill = max(1, width - len(left_txt))
+        if COLOR:
+            return (f"  {C.LINE}{BOX['tl']}{C.RESET}"
+                    f"{C.GREY}{h}{C.RESET} {C.PURPLE}{C.BOLD}{title}{C.RESET} "
+                    f"{C.LINE}{h * fill}{C.RESET}"
+                    f"{C.DIM}{right_txt}{C.RESET}"
+                    f"{C.LINE}{BOX['tr']}{C.RESET}")
+        return f"  {BOX['tl']}{left_txt}{h * fill}{right_txt}{BOX['tr']}"
 
-    def _draw(self):
-        if self.live and self.started:
-            sys.stdout.write("\r\033[2K" + self._line(self.fill))
-            sys.stdout.flush()
+    def _bottom(self, width):
+        h = BOX["h"]
+        if COLOR:
+            return f"  {C.LINE}{BOX['bl']}{h * width}{BOX['br']}{C.RESET}"
+        return f"  {BOX['bl']}{h * width}{BOX['br']}"
+
+    def _setup_lines(self):
+        width = self._width()
+        out = [self._top("setup", f"{sum(1 for i in self.setup_rows if i['state'] == 'ok')}"
+                                  f" of {len(self.setup_rows)} ready", width)]
+        for item in self.setup_rows:
+            state = item["state"]
+            if state == "busy":
+                icon, icol, lcol = self._spin_icon(), C.YELLOW, C.WHITE
+            elif state == "ok":
+                icon, icol, lcol = S_OK, C.GREEN, C.WHITE
+            elif state == "warn":
+                icon, icol, lcol = S_WARN, C.YELLOW, C.WHITE
+            elif state == "fail":
+                icon, icol, lcol = S_ERR, C.RED, C.RED
+            else:
+                icon, icol, lcol = S_RING, C.GREY, C.GREY
+
+            label = _clip(item["label"], 18)
+            detail = _clip(item["detail"], max(0, width - 26))
+            out.append(self._row([
+                (" ", " "),
+                (icon, f"{icol}{icon}{C.RESET}"),
+                ("  ", "  "),
+                (f"{label:<18}", f"{lcol}{label:<18}{C.RESET}"),
+                ("  ", "  "),
+                (detail, f"{C.DIM}{detail}{C.RESET}"),
+            ], width))
+            if state == "fail" and item.get("hint"):
+                hint = _clip(item["hint"], max(0, width - 9))
+                out.append(self._row([
+                    (" ", " "),
+                    ("   ", "   "),
+                    (S_HINT + " ", f"{C.RED}{S_HINT}{C.RESET} "),
+                    (hint, f"{C.DIM}{hint}{C.RESET}"),
+                ], width))
+        out.append(self._bottom(width))
+        return out
+
+    def _dash_lines(self):
+        width = self._width()
+        done = sum(1 for w in self.workers if w.status == "done")
+        out = [self._top("instances", f"{done} of {len(self.workers)} done", width)]
+        for worker in self.workers:
+            out.append(self._dash_row(worker, width))
+        out.append(self._bottom(width))
+        return out
+
+    def _block_lines(self):
+        lines = []
+        if self.setup_rows:
+            lines.extend(self._setup_lines())
+        if self.started and self.workers:
+            if lines:
+                lines.append("")
+            lines.extend(self._dash_lines())
+        return lines
+
+    # --- banner ------------------------------------------------------------
+    def _banner(self):
+        width = self._width()
+        out = [""]
+        if UNICODE:
+            out.append(f"{C.CYAN}{C.BOLD}  █▀▀ █▀█ █▀▀ █▀▀   █▀▀ █   ▄▀█ █ █ █▀▄ █▀▀{C.RESET}")
+            out.append(f"{C.BLUE}{C.BOLD}  █▀  █▀▄ ██▄ ██▄   █▄▄ █▄▄ █▀█ █▄█ █▄▀ ██▄{C.RESET}")
+        else:
+            out.append(f"  {C.CYAN}{C.BOLD}FREE CLAUDE{C.RESET}")
+
+        # The tagline sits inside the rule so the banner lines up with the boxes.
+        label = " headless key generator "
+        fill = max(2, width + 2 - len(label) - 2)
+        if COLOR:
+            out.append(f"  {C.LINE}{BOX['h'] * 2}{C.RESET}"
+                       f"{C.PURPLE}{C.BOLD}{label}{C.RESET}"
+                       f"{C.LINE}{BOX['h'] * fill}{C.RESET}")
+        else:
+            out.append(f"  {BOX['h'] * 2}{label}{BOX['h'] * fill}")
+        bits = [f"{self.count} browser" + ("s" if self.count > 1 else "")]
+        if self.count > 1:
+            bits.append(f"starts {START_DELAY}s apart")
+        bits.append(f"keys land in {os.path.basename(KEYS_FILE)}")
+        tail = _clip(f" {S_NOTE} ".join(bits), width + 2)
+        out.append(f"  {C.GREY}{tail}{C.RESET}")
+        out.append("")
+        self._erase()
+        for line in out:
+            print(line, flush=True)
+
+    # --- painting ----------------------------------------------------------
+    def _erase(self):
+        if not self.live or not self.block_rows:
+            return
+        out = ["\r\033[2K\033[1A"] * max(0, self.block_rows - 1) + ["\r\033[2K"]
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+        self.block_rows = 0
+
+    def _paint(self):
+        if not self.live or not self.started:
+            return
+        lines = self._block_lines()
+        self._erase()
+        if not lines:
+            return
+        sys.stdout.write("\n".join(lines))
+        sys.stdout.flush()
+        self.block_rows = len(lines)
+
+    def _print_lines(self, lines):
+        self._erase()
+        for line in lines:
+            print(line, flush=True)
+        self._paint()
 
     def _print(self, text):
-        self._clear()
-        print(text, flush=True)
-        if self.started:
-            self._draw()
+        self._print_lines([text])
+
+    def _tag(self):
+        worker = self._current()
+        if worker is None:
+            return ""
+        return self._chip(worker.number, worker.accent)
+
+    def _chip(self, number, accent_code=45):
+        tag = f"#{number:0{self.tag_w}d}"
+        if not COLOR:
+            return f" {tag} "
+        return f"\033[48;5;{accent_code}m\033[38;5;232m{C.BOLD} {tag} {C.RESET}"
 
     def _icon(self, icon, color, msg):
         with self.lock:
+            tag = self._tag()
+            lead = f"{tag}  " if tag else ""
             if COLOR:
-                self._print(f"  {color}{icon}{C.RESET}  {msg}")
+                self._print(f"  {lead}{color}{icon}{C.RESET}  {msg}")
             else:
-                self._print(f"  [{icon}] {msg}")
+                self._print(f"  {lead}[{icon}]  {msg}")
+
+    def _spin_icon(self):
+        return SPIN[int(time.time() * 12) % len(SPIN)]
+
 
 ui = UI()
 
@@ -424,8 +914,16 @@ CFT_KNOWN_GOOD = (
 )
 
 
-def _stream(cmd, prefix):
-    """Runs a command and mirrors its latest output line onto the status bar."""
+def _pkg_version(name):
+    try:
+        from importlib import metadata
+        return metadata.version(name)
+    except Exception:
+        return "installed"
+
+
+def _stream(cmd, prefix, item=None):
+    """Runs a command and shows its live tail in the checklist (or a worker row)."""
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -434,14 +932,47 @@ def _stream(cmd, prefix):
         encoding="utf-8",
         errors="replace",
     )
+    lines = queue.Queue()
+
+    def pump():
+        try:
+            for line in proc.stdout:
+                lines.put(line)
+        except Exception:
+            pass
+        finally:
+            lines.put(None)
+
+    threading.Thread(target=pump, daemon=True).start()
+
     last = ""
-    for line in proc.stdout:
-        line = line.strip()
+    shown = 0.0
+    code = None
+    while True:
+        try:
+            line = lines.get(timeout=0.1)
+        except queue.Empty:
+            line = ""
+        if line is None:
+            code = proc.wait()
+            break
         if line:
-            last = line
-            ui.set_note(f"{prefix}: {line[:80]}")
-    code = proc.wait()
-    ui.set_note("")
+            line = line.strip()
+            if line:
+                last = line[:66]
+        if item:
+            ui.setup_item(item, "busy", (prefix + ": " + last) if last else (prefix + "..."))
+        elif ui.bound() is not None:
+            ui.set_note(f"{prefix}: {last}" if last else prefix)
+        elif last:
+            now = time.time()
+            if now - shown >= 1.0:
+                ui.detail(f"{prefix}: {last}")
+                shown = now
+    if item:
+        ui.setup_item(item, "busy", (prefix + ": " + last) if last else prefix)
+    elif ui.bound() is not None:
+        ui.set_note("")
     return code, last
 
 
@@ -453,50 +984,60 @@ def _ensure_pip():
     )
     if probe.returncode == 0:
         return
+    ui.setup_item("Python packages", "busy", "pip is missing - setting it up")
     ui.warn("pip is missing — bootstrapping it with ensurepip.")
-    _stream([sys.executable, "-m", "ensurepip", "--upgrade"], "ensurepip")
+    code, tail = _stream([sys.executable, "-m", "ensurepip", "--upgrade"],
+                         "ensurepip", "Python packages")
+    if code != 0:
+        raise Exception(f"Could not bootstrap pip. Last output: {tail or 'unknown error'}")
 
 
 def ensure_playwright():
-    """Installs the playwright wheel when the import failed at startup."""
     global sync_playwright
     if sync_playwright is not None:
-        ui.ok("Playwright package present.")
+        ui.setup_item("Python packages", "ok", f"playwright {_pkg_version('playwright')}")
         return
-    ui.warn("Playwright is not installed — installing the Python package (one time).")
+    ui.setup_item("Python packages", "busy", "installing playwright (one time)")
+    ui.detail("Playwright is missing - installing it for you. This only happens once.")
     _ensure_pip()
     code, tail = _stream(
         [sys.executable, "-m", "pip", "install", "--upgrade", "--progress-bar", "off", "playwright"],
-        "pip",
+        "pip", "Python packages",
     )
     if code != 0:
+        ui.setup_item("Python packages", "fail", "pip could not install it",
+                      hint="run it yourself:  python -m pip install playwright")
         raise Exception(f"pip could not install Playwright. Last output: {tail or 'unknown error'}")
 
     import importlib
     importlib.invalidate_caches()
     from playwright.sync_api import sync_playwright as _sync_playwright
     sync_playwright = _sync_playwright
-    ui.ok("Playwright installed.")
+    ui.setup_item("Python packages", "ok", f"playwright {_pkg_version('playwright')} installed")
 
 
 def ensure_chromium():
-    """Downloads Playwright's Chromium build when it is not on disk yet."""
     if sync_playwright is None:
+        ui.setup_item("Chromium browser", "warn", "skipped - no Playwright")
         return
     try:
         with sync_playwright() as p:
             exe = p.chromium.executable_path
         if exe and os.path.exists(exe):
-            ui.ok("Chromium browser for Playwright present.")
+            ui.setup_item("Chromium browser", "ok", "ready")
             return
     except Exception:
         pass
 
-    ui.warn("Chromium for Playwright is missing — downloading it (about 150 MB, one time).")
-    code, tail = _stream([sys.executable, "-m", "playwright", "install", "chromium"], "chromium")
+    ui.setup_item("Chromium browser", "busy", "downloading - about 150 MB, one time")
+    ui.detail("Chromium is missing - downloading it now (about 150 MB, one time).")
+    code, tail = _stream([sys.executable, "-m", "playwright", "install", "chromium"],
+                         "chromium", "Chromium browser")
     if code != 0:
+        ui.setup_item("Chromium browser", "fail", "download failed",
+                      hint="run it yourself:  python -m playwright install chromium")
         raise Exception(f"Could not download Chromium. Last output: {tail or 'unknown error'}")
-    ui.ok("Chromium installed.")
+    ui.setup_item("Chromium browser", "ok", "downloaded")
 
 
 def _cft_platform():
@@ -508,10 +1049,9 @@ def _cft_platform():
 
 
 def ensure_chromedriver():
-    """Optional safety net: Playwright drives Chromium itself, but keep a driver for Selenium-style tooling."""
     found = shutil.which("chromedriver")
     if found:
-        ui.ok("chromedriver already on PATH.")
+        ui.setup_item("chromedriver", "ok", "already on PATH")
         return found
 
     target_dir = os.path.join(SCRIPT_DIR, "drivers")
@@ -519,9 +1059,9 @@ def ensure_chromedriver():
     local = os.path.join(target_dir, binary)
 
     if os.path.exists(local):
-        ui.ok(f"chromedriver present: {local}")
+        ui.setup_item("chromedriver", "ok", "found in drivers/")
     else:
-        ui.info("chromedriver not found — fetching the stable build.")
+        ui.setup_item("chromedriver", "busy", "fetching the stable build")
         try:
             plat = _cft_platform()
             with urllib.request.urlopen(CFT_KNOWN_GOOD, timeout=30) as resp:
@@ -531,7 +1071,6 @@ def ensure_chromedriver():
                 for d in meta["channels"]["Stable"]["downloads"]["chromedriver"]
                 if d["platform"] == plat
             )
-            ui.set_note("chromedriver: downloading")
             with urllib.request.urlopen(url, timeout=120) as resp:
                 blob = resp.read()
             os.makedirs(target_dir, exist_ok=True)
@@ -541,12 +1080,10 @@ def ensure_chromedriver():
                     shutil.copyfileobj(src, dst)
             if os.name != "nt":
                 os.chmod(local, 0o755)
-            ui.set_note("")
-            ui.ok(f"chromedriver installed to {local}")
+            ui.setup_item("chromedriver", "ok", "installed to drivers/")
         except Exception as e:
-            ui.set_note("")
-            ui.warn(f"chromedriver skipped ({e.__class__.__name__}: {e}).")
-            ui.detail("Not required here — Playwright talks to Chromium directly.")
+            ui.setup_item("chromedriver", "warn", f"optional - skipped ({e.__class__.__name__})",
+                          hint="only other tools need it; the run works without it")
             return None
 
     os.environ["PATH"] = target_dir + os.pathsep + os.environ.get("PATH", "")
@@ -565,11 +1102,9 @@ server_lock = threading.Lock()
 
 class CodeReceiverHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        """Serves a plaintext view of all received verification codes at http://localhost:8080"""
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        
         with server_lock:
             if not RECEIVED_CODES:
                 self.wfile.write(b"No verification codes received yet.\n")
@@ -579,7 +1114,6 @@ class CodeReceiverHandler(BaseHTTPRequestHandler):
                     self.wfile.write(f"Code: {item['code']} | Time: {item['time']}\n".encode('utf-8'))
 
     def do_POST(self):
-        """Receives verification codes pushed from the Tampermonkey Gmail script"""
         global RECEIVED_CODES
         content_length = int(self.headers.get('Content-Length', 0))
         post_data = self.rfile.read(content_length)
@@ -589,22 +1123,25 @@ class CodeReceiverHandler(BaseHTTPRequestHandler):
             if code:
                 import datetime
                 timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                owner = (data.get('email') or data.get('to') or data.get('recipient') or '')
                 with server_lock:
-                    RECEIVED_CODES.append({"code": code, "time": timestamp})
+                    RECEIVED_CODES.append({
+                        "code": str(code),
+                        "time": timestamp,
+                        "ts": time.time(),
+                        "email": str(owner).strip().lower(),
+                    })
                 ui.ok(f"Verification code received via bridge: {code}")
-                
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(b"Code received successfully!")
                 return
         except Exception as e:
             ui.err(f"Error parsing bridge payload: {e}")
-            
         self.send_response(400)
         self.end_headers()
         
     def log_message(self, format, *args):
-        # Suppress default server access logs
         return
 
 def start_local_server(port=BRIDGE_PORT):
@@ -614,17 +1151,26 @@ def start_local_server(port=BRIDGE_PORT):
 
 CONSUMED_CODES = set()
 
-def wait_for_bridge_code(timeout_s=90):
-    """Returns the first code the Tampermonkey bridge has not already handed over."""
+def wait_for_bridge_code(timeout_s=90, email=""):
+    """Oldest unconsumed code, preferring one the bridge tagged for `email`.
+
+    The userscript only sends the code, but an `email`/`to` field is honoured
+    when present, so a smarter bridge can pin the code to the right instance.
+    """
+    email = (email or "").strip().lower()
     start = time.time()
     last = -1
     while time.time() - start < timeout_s:
         with server_lock:
             for item in RECEIVED_CODES:
-                if item["code"] not in CONSUMED_CODES:
-                    CONSUMED_CODES.add(item["code"])
-                    ui.set_note("")
-                    return item["code"]
+                if item["code"] in CONSUMED_CODES:
+                    continue
+                owner = (item.get("email") or "").lower()
+                if email and owner and owner != email:
+                    continue
+                CONSUMED_CODES.add(item["code"])
+                ui.set_note("")
+                return item["code"]
         elapsed = int(time.time() - start)
         if elapsed != last:
             last = elapsed
@@ -633,17 +1179,18 @@ def wait_for_bridge_code(timeout_s=90):
     ui.set_note("")
     return None
 
-def discard_late_codes():
-    """A code that lands after the account exists is a null token — report and ignore it."""
+def discard_late_codes(older_than=120):
+    """Drops codes nobody claimed. Recent ones are left alone: another
+    instance may still be waiting for its own code."""
+    cutoff = time.time() - max(0, older_than)
     with server_lock:
-        late = [item for item in RECEIVED_CODES if item["code"] not in CONSUMED_CODES]
+        late = [item for item in RECEIVED_CODES
+                if item["code"] not in CONSUMED_CODES and item.get("ts", 0) < cutoff]
     for item in late:
         CONSUMED_CODES.add(item["code"])
-        ui.warn(f"Late code {item['code']} arrived after account creation — ignored.")
 
 # --- Account emails, passwords and API keys ---
 def _read_email_lines(path):
-    """Email-looking lines from a config/log file (junk like ff_email=... is skipped)."""
     lines = []
     try:
         if not os.path.exists(path):
@@ -662,34 +1209,31 @@ def _read_email_lines(path):
 
 
 def recent_accounts():
-    """The last few accounts written to accounts.txt (newest last)."""
     return _read_email_lines(ACCOUNTS_FILE)[-ACCOUNT_HISTORY:]
 
 
 def _used_emails():
-    """Every email already spent: accounts.txt plus legacy variants in assets.txt."""
     used = set(_read_email_lines(ACCOUNTS_FILE))
     used.update(_read_email_lines(ASSETS_FILE))
     return used
 
 
 def record_account_email(email):
-    """Appends the account to accounts.txt, then keeps only the most recent few."""
     email = (email or "").strip().lower()
     if not email:
         return
-    lines = _read_email_lines(ACCOUNTS_FILE)
-    lines.append(email)
-    lines = lines[-ACCOUNT_HISTORY:]
-    try:
-        with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
-    except Exception as e:
-        ui.warn(f"Could not update {os.path.basename(ACCOUNTS_FILE)} ({e.__class__.__name__}).")
+    with FILE_LOCK:
+        lines = _read_email_lines(ACCOUNTS_FILE)
+        lines.append(email)
+        lines = lines[-ACCOUNT_HISTORY:]
+        try:
+            with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except Exception:
+            pass
 
 
 def dotted_sequence(username):
-    """user, u.ser, us.er, use.r, u.s.er, u.se.r, us.e.r, ... (dots added left to right)."""
     gaps = len(username) - 1
     for dots in range(0, gaps + 1):
         for positions in itertools.combinations(range(gaps), dots):
@@ -702,7 +1246,6 @@ def dotted_sequence(username):
 
 
 def _next_variant(username, domain, used, after=None):
-    """Returns (email or None, saw_after) for the first unused variant after `after`."""
     reached = after is None
     for local in dotted_sequence(username):
         email = f"{local}@{domain}".lower()
@@ -716,7 +1259,6 @@ def _next_variant(username, domain, used, after=None):
 
 
 def _next_numbered(username, domain, used, start=100):
-    """Next free numbered alias (<username>100@..., <username>101@...)."""
     n = max(100, start)
     while n < 10000 and f"{username}{n}@{domain}" in used:
         n += 1
@@ -724,7 +1266,6 @@ def _next_numbered(username, domain, used, start=100):
 
 
 def next_account_email(base_email):
-    """Next account in the dot sequence, continuing after the newest in accounts.txt."""
     try:
         username, domain = base_email.strip().split("@", 1)
     except ValueError:
@@ -736,7 +1277,6 @@ def next_account_email(base_email):
     used = _used_emails()
     last = recent[-1] if recent else None
 
-    # Already past the dotted variants: keep counting numbered aliases.
     if last and last.endswith("@" + domain):
         match = re.match(rf"^{re.escape(username)}(\d+)$", last.split("@", 1)[0])
         if match:
@@ -744,16 +1284,25 @@ def next_account_email(base_email):
 
     email, saw_last = _next_variant(username, domain, used, after=last)
     if email is None and last is not None and not saw_last:
-        # The newest entry was not one of ours, so start the sequence again.
         email, _ = _next_variant(username, domain, used)
     if email is None:
-        # Every dot combination is used up — fall back to numbered aliases.
         email = _next_numbered(username, domain, used)
     return email
 
 
+def claim_account_email(base_email):
+    """Picks the next dotted variant and records it in one atomic step.
+
+    Two instances starting together would otherwise both read the same
+    accounts.txt and pick the same address.
+    """
+    with FILE_LOCK:
+        email = next_account_email(base_email)
+        record_account_email(email)
+        return email
+
+
 def generate_password(length=18):
-    """Random password with all four character classes and no look-alike glyphs."""
     rng = random.SystemRandom()
     lower = "abcdefghijkmnopqrstuvwxyz"
     upper = "ABCDEFGHJKLMNPQRSTUVWXYZ"
@@ -768,55 +1317,45 @@ def generate_password(length=18):
 
 
 def save_api_key(key):
-    """Appends the key to keys.txt (created on first use); the file is never rewritten."""
     key = (key or "").strip()
     name = os.path.basename(KEYS_FILE)
     if not key:
         return False
-    try:
-        if os.path.exists(KEYS_FILE):
-            with open(KEYS_FILE, "r", encoding="utf-8", errors="replace") as f:
-                if key in {line.strip() for line in f}:
-                    ui.info(f"{name} already lists this key — nothing to add.")
-                    return False
-        with open(KEYS_FILE, "a", encoding="utf-8") as f:
-            f.write(key + "\n")
-    except Exception as e:
-        ui.warn(f"Could not write {name} ({e.__class__.__name__}).")
-        return False
+    with FILE_LOCK:
+        try:
+            if os.path.exists(KEYS_FILE):
+                with open(KEYS_FILE, "r", encoding="utf-8", errors="replace") as f:
+                    if key in {line.strip() for line in f}:
+                        return False
+            with open(KEYS_FILE, "a", encoding="utf-8") as f:
+                f.write(key + "\n")
+        except Exception:
+            return False
     ui.ok(f"API key saved to {name}.")
     return True
 
 
 def ensure_output_files():
-    """Creates keys.txt / accounts.txt up front so a long run cannot fail at the end."""
     for path in (KEYS_FILE, ACCOUNTS_FILE):
-        name = os.path.basename(path)
         if os.path.exists(path):
             continue
         try:
             with open(path, "a", encoding="utf-8"):
                 pass
-        except Exception as e:
-            ui.warn(f"Could not create {name} ({e.__class__.__name__}).")
-            continue
-        ui.detail(f"Created {name}.")
+        except Exception:
+            pass
 
 
 def _remember_base_email(email):
-    """Adds a user-supplied base email to assets.txt so later runs find it."""
-    name = os.path.basename(ASSETS_FILE)
     try:
         with open(ASSETS_FILE, "a", encoding="utf-8") as f:
             f.write((email or "").strip().lower() + "\n")
-    except Exception as e:
-        ui.warn(f"Could not write {name} ({e.__class__.__name__}).")
+    except Exception:
+        pass
 
 
 def get_base_regular_email():
-    """Gets the base home email from assets.txt or prompts the user."""
     email_to_use = ""
-
     name = os.path.basename(ASSETS_FILE)
     if os.path.exists(ASSETS_FILE):
         lines = _read_email_lines(ASSETS_FILE)
@@ -824,34 +1363,26 @@ def get_base_regular_email():
             email_to_use = lines[0]
 
     if not email_to_use:
-        ui.warn(f"No base email found in {name}.")
         email_to_use = ui.ask("Enter your regular home email (e.g. user@gmail.com):")
         if "@" not in email_to_use:
             raise Exception("That doesn't look like an email address.")
         _remember_base_email(email_to_use)
-        ui.ok(f"Saved {email_to_use} to {name}.")
-
     return email_to_use
 
 
 # --- hCaptcha solving (NoneCap API) ---
-# The key lives in assets.txt as `nonecap=...` or `nonecapapi=...` (any case).
 CAPTCHA_API_URL = "https://api.nonecap.com/v1/solves"
-CAPTCHA_TIMEOUT = 180          # total budget for one solve, polling included
-CAPTCHA_POLL_WAIT = 90         # seconds the API may hold a request open
-CAPTCHA_WAIT = 12              # seconds to let the widget render before giving up
-CAPTCHA_CLICK_TIMEOUT = 1500   # ms spent on each checkbox selector
+CAPTCHA_TIMEOUT = 180
+CAPTCHA_POLL_WAIT = 90
+CAPTCHA_WAIT = 12
+CAPTCHA_CLICK_TIMEOUT = 1500
 
-# The checkbox widget lives in a cross-origin iframe, but Playwright can still
-# drive it. The challenge frame must not match, or frame_locator hits strict mode.
 CAPTCHA_FRAME_SELECTOR = (
     'iframe[src*="frame=checkbox"], iframe[src*="hcaptcha.com"][title*="checkbox" i]'
 )
 
 CAPTCHA_INFO_JS = r"""() => {
     const FRAME_SEL = __FRAME_SEL__;
-
-    // hCaptcha is often mounted inside a React portal or a shadow root.
     const roots = [];
     const seenRoots = new Set();
     const collect = (root) => {
@@ -885,8 +1416,6 @@ CAPTCHA_INFO_JS = r"""() => {
             const parsed = new URL(url, location.href);
             const query = parsed.searchParams.get('sitekey');
             if (query) return query;
-            // hCaptcha puts the sitekey in the fragment, not the query string:
-            //   hcaptcha.html#frame=checkbox&...&sitekey=663c73ac-...
             const hash = parsed.hash ? parsed.hash.slice(1) : '';
             return new URLSearchParams(hash).get('sitekey');
         } catch (e) {
@@ -894,9 +1423,6 @@ CAPTCHA_INFO_JS = r"""() => {
         }
     };
 
-    // 1) the container attribute, 2) the widget iframe URL, 3) hCaptcha's own
-    // checksiteconfig request recorded in the resource timeline (this is the one
-    // that works for React-driven widgets that render no data-sitekey at all).
     let sitekey = null;
     for (const el of widgets) {
         const key = el.getAttribute('data-sitekey');
@@ -967,10 +1493,6 @@ CAPTCHA_INJECT_JS = r"""(token) => {
         if (match) widgetId = match[1];
     }
 
-    // 0) The widget's own reader. vue-hcaptcha (this site's wrapper) calls
-    //    hcaptcha.getResponse(widgetId) inside its verify callback, so answering
-    //    that is what makes the app submit the real token. Once
-    //    __fccCaptchaToken is cleared for a retry the original is used again.
     let patched = 0;
     const hc = window.hcaptcha;
     if (hc && typeof hc.getResponse === 'function') {
@@ -991,7 +1513,6 @@ CAPTCHA_INJECT_JS = r"""(token) => {
 
     window.__fccCaptchaToken = token;
 
-    // 1) The hidden field hCaptcha normally fills in itself.
     let written = 0;
     for (const root of roots) {
         for (const el of root.querySelectorAll(
@@ -1010,7 +1531,6 @@ CAPTCHA_INJECT_JS = r"""(token) => {
         written = 1;
     }
 
-    // 2) Plain <div data-callback="fn"> integrations.
     const fired = [];
     const seenNames = new Set();
     for (const root of roots) {
@@ -1022,9 +1542,6 @@ CAPTCHA_INJECT_JS = r"""(token) => {
         }
     }
 
-    // 3) React / Vue integrations never read the DOM — they keep the token in
-    //    component state. Walk up the React fiber tree from the widget and call
-    //    the verification props (onSuccess / onVerify / callback / ...).
     const NAMES = /^(callback|onSuccess|onVerify|onToken|onCaptcha.*|onComplete|onSolve|handleVerify|verifyCallback|captchaCallback)$/i;
     const seenFns = new Set();
     const callProps = (props, tag) => {
@@ -1064,9 +1581,6 @@ CAPTCHA_INJECT_JS = r"""(token) => {
 
     window.__fccCaptchaToken = token;
 
-    // 4) hCaptcha's own render callback, captured by the init hook. This is the
-    //    one Vue wrappers (vue-hcaptcha) actually listen to — firing it sets the
-    //    form's captcha field and lets the page submit by itself.
     let native = 0;
     for (const cb of (window.__fccCaptchaCallbacks || [])) {
         if (typeof cb !== 'function') continue;
@@ -1092,9 +1606,6 @@ CAPTCHA_CLEAR_JS = r"""() => {
     return cleared;
 }"""
 
-# Installed before the page loads hCaptcha. Wrappers like vue-hcaptcha hand
-# their onVerify callback to hcaptcha.render(); keeping a copy of it is the only
-# reliable way to deliver an API token to the app's own form state.
 CAPTCHA_HOOK_JS = r"""(() => {
     if (window.__fccCaptchaHooked) return;
     window.__fccCaptchaHooked = true;
@@ -1112,8 +1623,6 @@ CAPTCHA_HOOK_JS = r"""(() => {
         } catch (e) {}
     };
 
-    // api.js assigns window.hcaptcha first and defines render a moment later,
-    // so the hook has to patch the object — patching the assignment misses it.
     const patch = () => {
         const h = window.hcaptcha;
         if (!h || typeof h.render !== 'function' || h.render.__fccWrapped) return false;
@@ -1137,7 +1646,6 @@ CAPTCHA_HOOK_JS = r"""(() => {
 
 
 def install_captcha_hook(context):
-    """Adds the hCaptcha callback hook to a browser context (all its pages)."""
     try:
         context.add_init_script(CAPTCHA_HOOK_JS)
     except Exception as e:
@@ -1145,7 +1653,6 @@ def install_captcha_hook(context):
 
 
 def _nonecap_key():
-    """The NoneCap API key from assets.txt (`nonecap=...` / `nonecapapi=...`)."""
     key = ""
     try:
         if not os.path.exists(ASSETS_FILE):
@@ -1161,7 +1668,6 @@ def _nonecap_key():
 
 
 def _nonecap_call(method, path, api_key, payload=None, timeout=60):
-    """One NoneCap request. Returns (json_dict, http_status, error_text)."""
     headers = {
         "accept": "application/json",
         "authorization": f"Bearer {api_key}",
@@ -1205,11 +1711,6 @@ def _nonecap_call(method, path, api_key, payload=None, timeout=60):
 
 
 def _nonecap_solve(api_key, sitekey, page_url, rqdata=None, timeout=CAPTCHA_TIMEOUT):
-    """Solves one hCaptcha. Returns (token, error, info_dict).
-
-    POST /v1/solves holds the connection up to CAPTCHA_POLL_WAIT seconds; if the
-    solve is still running the API answers 202 and the returned id is polled.
-    """
     payload = {
         "type": "hcaptcha_enterprise" if rqdata else "hcaptcha",
         "sitekey": sitekey,
@@ -1257,7 +1758,6 @@ def _nonecap_solve(api_key, sitekey, page_url, rqdata=None, timeout=CAPTCHA_TIME
 
 
 def _nonecap_solve_with_ui(api_key, sitekey, page_url, rqdata=None):
-    """Runs the blocking solve on a thread so the bar can show elapsed time."""
     box = {}
 
     def work():
@@ -1289,8 +1789,6 @@ CAPTCHA_UA_JS = r"""(ua) => {
 
 
 def _align_user_agent(page, ua):
-    """Uses the solver's browser version for later requests — some sites bind
-    the token to the User-Agent that solved it."""
     ua = (ua or "").strip()
     if not ua:
         return
@@ -1312,7 +1810,6 @@ def _align_user_agent(page, ua):
 
 
 def _captcha_info(page):
-    """Reads the widget state from the page (None if the page is not ready)."""
     js = CAPTCHA_INFO_JS.replace("__FRAME_SEL__", json.dumps(CAPTCHA_FRAME_SELECTOR))
     try:
         info = page.evaluate(js)
@@ -1322,7 +1819,6 @@ def _captcha_info(page):
 
 
 def _wait_for_captcha(page, timeout=None):
-    """Polls until the widget has actually rendered — it loads asynchronously."""
     budget = CAPTCHA_WAIT if timeout is None else timeout
     started = time.time()
     told = False
@@ -1341,7 +1837,6 @@ def _wait_for_captcha(page, timeout=None):
 
 
 def _clear_captcha_token(page):
-    """Drops a token we injected earlier so a retry gets a fresh one."""
     try:
         cleared = page.evaluate(CAPTCHA_CLEAR_JS)
     except Exception:
@@ -1350,7 +1845,6 @@ def _clear_captcha_token(page):
 
 
 def _try_captcha_checkbox(page):
-    """Clicks the widget's own checkbox. Free, and the page sees a genuine solve."""
     for selector in ("#checkbox", '[role="checkbox"]', "text=I am human"):
         try:
             box = page.frame_locator(CAPTCHA_FRAME_SELECTOR).locator(selector).first
@@ -1363,7 +1857,6 @@ def _try_captcha_checkbox(page):
 
 
 def _click_solves(page):
-    """Clicks the checkbox and reports whether the widget itself produced a token."""
     ui.detail("Clicking the hCaptcha checkbox...")
     if not _try_captcha_checkbox(page):
         return False
@@ -1378,13 +1871,6 @@ def _click_solves(page):
 
 
 def solve_hcaptcha(page, force=False, click_first=False):
-    """Solves the page's hCaptcha.
-
-    Returns a token or a short status ("already-solved", "clicked", "absent"),
-    or None when it could not be solved. `force` ignores a token we injected
-    ourselves so a retry after a failed submit gets a fresh one. `click_first`
-    tries the widget's own checkbox before spending an API credit.
-    """
     info = _wait_for_captcha(page)
     if not info:
         return "absent"
@@ -1446,13 +1932,11 @@ def solve_hcaptcha(page, force=False, click_first=False):
 
 
 def submit_email_and_wait_for_success(page, send_btn, base_email):
-    """Fills a fresh dotted email variant until the site confirms the code was sent."""
     start_time = time.time()
     error_logged = False
 
     while time.time() - start_time < 300:
-        target_email = next_account_email(base_email)
-        record_account_email(target_email)
+        target_email = claim_account_email(base_email)
         ui.info(f"Trying email: {target_email}")
 
         email_input = page.locator('input[placeholder="Email"]')
@@ -1462,8 +1946,6 @@ def submit_email_and_wait_for_success(page, send_btn, base_email):
         page.keyboard.press("Backspace")
         email_input.fill(target_email)
 
-        # The hCaptcha widget only renders *after* this click, and the page
-        # sends the code by itself once verification completes.
         _clear_captcha_token(page)
         send_btn.scroll_into_view_if_needed()
         send_btn.click(force=True)
@@ -1497,7 +1979,6 @@ def submit_email_and_wait_for_success(page, send_btn, base_email):
                         else:
                             ui.ok("Captcha answered; the code is being sent.")
                     elif time.time() - attempt_start > 4:
-                        # No widget after this long: this build does not need one.
                         captcha_done = True
             except Exception:
                 pass
@@ -1509,15 +1990,13 @@ def submit_email_and_wait_for_success(page, send_btn, base_email):
 
     raise Exception("Timed out trying email variations after multiple error cycles.")
 
+
 # --- Ace API key capture ---
 ACE_COPY_JS = r"""() => {
     const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
     const isMasked = (s) => /\.{3,}|\u2026/.test(s || '');
     const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-    // The Ace UI shows:  [Bearer] c978...a559f134d352  v  [copy]
-    // "Bearer" is its own element, so the key value/text has NO "Bearer " prefix.
-    // Match the token itself instead (masked, or a long opaque secret). App IDs are skipped.
     const keyish = (s) => {
         const t = norm(s).replace(/^Bearer\s+/i, '').trim();
         if (!t) return false;
@@ -1528,7 +2007,6 @@ ACE_COPY_JS = r"""() => {
 
     let rect = null;
 
-    // 1) A real input/textarea holding the key.
     for (const el of document.querySelectorAll('input, textarea')) {
         if (!keyish(el.value || '')) continue;
         const r = el.getBoundingClientRect();
@@ -1537,7 +2015,6 @@ ACE_COPY_JS = r"""() => {
         break;
     }
 
-    // 2) The key rendered as text (Ant Design <Select>/span).
     if (!rect) {
         let best = null, bestArea = Infinity;
         for (const el of document.querySelectorAll('div, span, p, a, select')) {
@@ -1557,7 +2034,6 @@ ACE_COPY_JS = r"""() => {
     const candidates = [];
 
     const add = (el, how) => {
-        // Skip the Select dropdown chevron; we want the copy/eye control.
         if (el.closest('[class*="arrow" i], [class*="down" i], [class*="chevron" i]')) return;
         const r = el.getBoundingClientRect();
         if (r.width < 4 || r.width > 90 || r.height < 4 || r.height > 90) return;
@@ -1571,15 +2047,12 @@ ACE_COPY_JS = r"""() => {
         candidates.push({ el: target, x: sx, y: sy, how });
     };
 
-    // Named/titled copy controls first...
     for (const el of document.querySelectorAll(
         '[aria-label*="copy" i], [title*="copy" i], .anticon-copy, [class*="copy" i], [data-icon="copy"]'
     )) add(el, 'attr');
 
-    // ...then any small icon to the right of the key (the copy glyph's geometry).
     for (const svg of document.querySelectorAll('svg')) add(svg, 'geom');
 
-    // Rightmost first within each group -> copy/eye glyph beats the chevron.
     candidates.sort((a, b) => (a.how === b.how ? b.x - a.x : (a.how === 'attr' ? -1 : 1)));
     candidates.forEach((c, i) => {
         try { c.el.setAttribute('data-ace-copy-id', String(i)); } catch (e) {}
@@ -1599,8 +2072,6 @@ ACE_CLICK_COPY_JS = r"""(i) => {
     return true;
 }"""
 
-# Reads a full (unmasked) key straight out of the DOM, in case an eye/reveal
-# control already exposed it in the field.
 ACE_READ_KEY_JS = r"""() => {
     const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
     const isMasked = (s) => /\.{3,}|\u2026/.test(s || '');
@@ -1625,7 +2096,6 @@ def is_masked(token):
     return "..." in token or "\u2026" in token
 
 def _wait_for_clipboard_change(page, marker, timeout_s):
-    """Polls the clipboard until it differs from `marker`; returns the trimmed value."""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         cur = read_clipboard(page)
@@ -1637,36 +2107,7 @@ def _wait_for_clipboard_change(page, marker, timeout_s):
 def _usable_key(cand):
     return bool(cand) and not is_masked(cand) and not APPID_RE.match(cand) and len(cand) >= 16
 
-def _dump_key_dom(page):
-    """Prints the nearby key-ish elements so a failed lookup is diagnosable."""
-    try:
-        rows = page.evaluate(r"""() => {
-            const out = [];
-            for (const el of document.querySelectorAll('input, textarea, span, div, button')) {
-                const raw = el.value || (el.children.length ? '' : el.textContent) || '';
-                const t = (raw || '').replace(/\s+/g, ' ').trim();
-                if (!t || t.length > 90) continue;
-                if (!/Bearer|key|\.{3}|[0-9a-f]{6}/i.test(t)) continue;
-                const r = el.getBoundingClientRect();
-                if (r.width < 10 || r.height < 10) continue;
-                out.push({
-                    tag: el.tagName, type: el.type || '', text: t.slice(0, 70),
-                    cls: (el.className && el.className.baseVal !== undefined ? el.className.baseVal : el.className) || '',
-                    x: Math.round(r.x), y: Math.round(r.y),
-                    w: Math.round(r.width), h: Math.round(r.height)
-                });
-                if (out.length >= 20) break;
-            }
-            return out;
-        }""")
-        for row in rows or []:
-            ui.detail(f"{row['tag']:<6} {row['type']:<8} ({row['x']},{row['y']}) "
-                      f"{row['w']}x{row['h']}  {row['text']}  [{str(row['cls'])[:40]}]")
-    except Exception as e:
-        ui.detail(f"dump failed: {e}")
-
 def grab_ace_api_key(ace_page):
-    """Clicks the copy glyph to the right of the API key field, then reads the clipboard."""
     ace_page.bring_to_front()
     ace_page.wait_for_timeout(800)
 
@@ -1693,16 +2134,9 @@ def grab_ace_api_key(ace_page):
         except Exception as e:
             ui.err(f"Copy glyph lookup failed: {e}")
 
-        rect = (info or {}).get("rect")
         cands = (info or {}).get("candidates") or []
 
-        if rect:
-            ui.info(f"API key field at ({rect['x']:.0f}, {rect['y']:.0f}) — {len(cands)} copy candidate(s).")
-        else:
-            ui.warn("Could not find the API key field in the DOM.")
-
         for i, c in enumerate(cands):
-            ui.info(f"Clicking copy glyph #{i + 1} at ({c['x']:.0f}, {c['y']:.0f}) [{c['how']}].")
             try:
                 clicked = bool(ace_page.evaluate(ACE_CLICK_COPY_JS, i))
             except Exception:
@@ -1710,8 +2144,6 @@ def grab_ace_api_key(ace_page):
 
             cand = _wait_for_clipboard_change(ace_page, marker, 2.5) if clicked else ""
 
-            # A DOM click can land on an svg wrapper instead of the handler;
-            # retry the same spot with a real mouse click.
             if not _usable_key(cand):
                 try:
                     ace_page.mouse.click(c["x"], c["y"])
@@ -1721,7 +2153,6 @@ def grab_ace_api_key(ace_page):
                 if _usable_key(mouse_cand):
                     cand = mouse_cand
 
-            # Some copy controls reveal the plaintext in the field instead of copying.
             if not _usable_key(cand):
                 try:
                     revealed = (ace_page.evaluate(ACE_READ_KEY_JS) or "").strip()
@@ -1734,24 +2165,18 @@ def grab_ace_api_key(ace_page):
                 ui.ok(f"Copy glyph #{i + 1} produced the full API key.")
                 key = cand
                 break
-            if cand:
-                ui.warn(f"Glyph #{i + 1} returned {cand[:14]}{S_ELL} — not the full key.")
 
         if key:
             break
-
-        ui.warn(f"Copy attempt {attempt} produced no usable key.")
         ace_page.wait_for_timeout(600)
 
     if not key:
         ui.err("Could not read a full key from any glyph near the API key field.")
-        ui.detail("Dumping the surrounding DOM:")
-        _dump_key_dom(ace_page)
         while not key:
             manual = ui.ask("Paste the full Ace Data Cloud API key:")
             manual = re.sub(r"^Bearer\s+", "", manual, flags=re.IGNORECASE).strip()
             if not manual or is_masked(manual) or len(manual) < 16:
-                ui.warn("Still masked or too short — paste the full key, not the shortened display.")
+                ui.warn("Still masked or too short — paste the full key.")
             elif APPID_RE.match(manual):
                 ui.warn("That's an App ID, not the API key.")
             else:
@@ -1764,9 +2189,8 @@ def grab_ace_api_key(ace_page):
 
 
 def _store_on_clipboard(page, key):
-    """Best-effort: puts the key on the OS clipboard so it can be pasted by hand."""
     try:
-        wrote = page.evaluate(
+        page.evaluate(
             """async (v) => {
                 try { await navigator.clipboard.writeText(v); return true; }
                 catch (e) { return false; }
@@ -1774,15 +2198,9 @@ def _store_on_clipboard(page, key):
             key,
         )
     except Exception:
-        wrote = False
-
-    if wrote:
-        ui.detail("Clipboard now holds the full key.")
-    else:
-        ui.warn("Could not write the key to the clipboard — copy it from the box above.")
+        pass
 
 
-# --- Free credit claim ---
 EARN_CREDIT_PATTERNS = (
     re.compile(r"earn\s*\d*\s*credits?", re.IGNORECASE),
     re.compile(r"earn.{0,12}free|free.{0,12}credit", re.IGNORECASE),
@@ -1792,7 +2210,6 @@ EARN_APPLY_RE = re.compile(r"^\s*Apply\s*$", re.IGNORECASE)
 
 
 def _first_visible(locator, limit=25):
-    """First visible element in a locator, or None."""
     try:
         count = locator.count()
     except Exception:
@@ -1808,7 +2225,6 @@ def _first_visible(locator, limit=25):
 
 
 def _find_credit_control(page):
-    """Finds the 'earn 1 credit for free' style control on the docs page."""
     scopes = ("button:visible, a:visible, [role='button']:visible", "span:visible")
     for pattern in EARN_CREDIT_PATTERNS:
         for scope in scopes:
@@ -1822,7 +2238,6 @@ CREDIT_OK_RE = re.compile(r"success|claimed|credited|added to your account", re.
 
 
 def _credit_confirmed(page, timeout=0):
-    """True when the page shows a success message (uses rendered text only)."""
     deadline = time.time() + max(0.0, timeout)
     while True:
         try:
@@ -1859,7 +2274,6 @@ DEDICATED_TAG_JS = r"""() => {
     const hits = all.filter((el) => re.test(flat(el.innerText || el.textContent)) && visible(el));
     if (!hits.length) return null;
 
-    // Smallest matching element = the label/title of the card; prefer real controls.
     const label = hits.sort((a, b) => area(a) - area(b))[0];
     let pick = label;
     if (!clickable(pick)) {
@@ -1877,8 +2291,6 @@ DEDICATED_TAG_JS = r"""() => {
 
 
 def select_dedicated_balance(page, timeout=6.0):
-    """Clicks the 'Dedicated Balance' button/card. Never fatal."""
-    ui.info("Looking for the 'Dedicated Balance' button...")
     deadline = time.time() + max(0.0, timeout)
     label = None
     while True:
@@ -1891,15 +2303,13 @@ def select_dedicated_balance(page, timeout=6.0):
         page.wait_for_timeout(300)
 
     if not label:
-        ui.warn("No 'Dedicated Balance' button on the page — skipping that click.")
         return False
 
     try:
         target = page.locator('[data-fcc-dedicated="1"]').first
         target.scroll_into_view_if_needed()
         target.click(force=True)
-    except Exception as e:
-        ui.warn(f"Could not click 'Dedicated Balance' ({e.__class__.__name__}).")
+    except Exception:
         return False
 
     page.wait_for_timeout(800)
@@ -1908,7 +2318,6 @@ def select_dedicated_balance(page, timeout=6.0):
 
 
 def claim_free_credit(page, select_dedicated=True):
-    """Opens the Claude docs page and claims the free credit (earn free credit -> Apply)."""
     ui.info(f"Opening {CREDIT_URL} ...")
     page.bring_to_front()
     try:
@@ -1924,22 +2333,12 @@ def claim_free_credit(page, select_dedicated=True):
 
     earn = _find_credit_control(page)
     if earn is None:
-        path = debug_shot(page, "credit-earn")
-        ui.warn(f"No 'earn free credit' control on that page (screenshot: {path}).")
         return False
 
-    label = ""
-    try:
-        label = " ".join((earn.inner_text() or "").split())[:60]
-    except Exception:
-        pass
-    ui.info(f"Clicking '{label}'..." if label else "Clicking the free-credit control...")
     try:
         earn.scroll_into_view_if_needed()
         earn.click(force=True)
-    except Exception as e:
-        path = debug_shot(page, "credit-earn")
-        ui.warn(f"Could not click the free-credit control ({e.__class__.__name__}; screenshot: {path}).")
+    except Exception:
         return False
 
     page.wait_for_timeout(1800)
@@ -1949,27 +2348,20 @@ def claim_free_credit(page, select_dedicated=True):
         apply_btn = _first_visible(page.locator('text="Apply"'))
     if apply_btn is None:
         if _credit_confirmed(page):
-            ui.ok("Free credit claimed (no Apply step needed).")
+            ui.ok("Free credit claimed.")
             if select_dedicated:
                 select_dedicated_balance(page)
             return True
-        path = debug_shot(page, "credit-apply")
-        ui.warn(f"No 'Apply' button appeared for the free credit (screenshot: {path}).")
         return False
 
-    ui.info("Clicking 'Apply'...")
     try:
         apply_btn.scroll_into_view_if_needed()
         apply_btn.click(force=True)
-    except Exception as e:
-        path = debug_shot(page, "credit-apply")
-        ui.warn(f"Could not click 'Apply' ({e.__class__.__name__}; screenshot: {path}).")
+    except Exception:
         return False
 
     if _credit_confirmed(page, 12):
         ui.ok("Free credit claimed.")
-    else:
-        ui.warn("'Apply' clicked, but no confirmation text appeared — check the credit balance.")
 
     if select_dedicated:
         select_dedicated_balance(page)
@@ -1977,7 +2369,6 @@ def claim_free_credit(page, select_dedicated=True):
 
 
 def fill_field(page, el, value, label, settle_ms=400):
-    """Fills a field, then re-reads it so a React reset is never mistaken for success."""
     def current():
         try:
             return (el.input_value() or "").strip()
@@ -1986,7 +2377,6 @@ def fill_field(page, el, value, label, settle_ms=400):
 
     el.scroll_into_view_if_needed()
     if current() == value:
-        ui.ok(f"{label} already set.")
         return
 
     try:
@@ -1995,10 +2385,8 @@ def fill_field(page, el, value, label, settle_ms=400):
         pass
     page.wait_for_timeout(settle_ms)
     if current() == value:
-        ui.ok(f"{label} set.")
         return
 
-    ui.warn(f"Direct fill did not stick on {label} — typing it instead.")
     try:
         el.click(force=True)
         page.keyboard.press("Control+A")
@@ -2006,38 +2394,7 @@ def fill_field(page, el, value, label, settle_ms=400):
         page.keyboard.type(value, delay=20)
     except Exception:
         pass
-    page.wait_for_timeout(settle_ms)
-    if current() == value:
-        ui.ok(f"{label} set (typed).")
-        return
 
-    ui.warn(f"Keystrokes did not stick on {label} — writing the value directly.")
-    try:
-        page.evaluate("""([el, val]) => {
-            const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-            Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, val);
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-            el.dispatchEvent(new Event('blur', { bubbles: true }));
-        }""", [el.element_handle(), value])
-    except Exception:
-        pass
-    page.wait_for_timeout(settle_ms)
-
-    if current() != value:
-        raise Exception(f"Could not set {label} (the field keeps resetting).")
-    ui.ok(f"{label} set (direct write).")
-
-
-def debug_shot(page, name):
-    """Saves a screenshot next to the script so a failed step can be inspected later."""
-    path = os.path.join(SCRIPT_DIR, f"debug_{name}.png")
-    try:
-        page.screenshot(path=path)
-        ui.warn(f"Screenshot saved: {path}")
-    except Exception:
-        pass
-    return path
 
 # --- free-claude-code admin panel ---
 FCC_SAVE_RE = re.compile(r"^\s*Save\s*$", re.IGNORECASE)
@@ -2071,7 +2428,6 @@ FCC_FIND_CARD_JS = r"""(name) => {
 
 
 def open_fcc_admin(context, page=None):
-    """Opens (or reuses) the free-claude-code admin page and waits for it to render."""
     ui.info(f"Opening {FCC_ADMIN_URL} ...")
     admin = page if page is not None else context.new_page()
     try:
@@ -2092,19 +2448,13 @@ def open_fcc_admin(context, page=None):
     return admin
 
 
-def explain_fcc_setup():
-    """Tells the user how to install and launch free-claude-code."""
-    ui.detail("free-claude-code is not answering, so it is probably not installed or not running.")
-    ui.detail("To install it, run this in PowerShell:")
-    ui.blank()
-    ui.cmd(FCC_INSTALL_CMD)
-    ui.blank()
-    ui.detail('Then open the Windows search bar, type "free-claude-code" and launch it.')
-    ui.detail("It starts a local server and serves the admin panel on port 8082.")
+_FCC_UNAVAILABLE = False
 
 
 def prompt_fcc_running(context):
-    """Proactively offers to install free-claude-code if it's missing, then guides the user to start it. None = skipped."""
+    global _FCC_UNAVAILABLE
+    if _FCC_UNAVAILABLE:
+        return None
     admin = None
     while True:
         try:
@@ -2120,19 +2470,15 @@ def prompt_fcc_running(context):
                     ui.ok("Installation script finished.")
                 except Exception as ex:
                     ui.err(f"Installation failed: {ex}")
-                ui.detail('Please open the Windows search bar, type "free-claude-code" and launch it.')
-            else:
-                explain_fcc_setup()
-
             choice = ui.ask("Press Enter to retry once it is running (type 'skip' to carry on without it)")
             if choice.strip().lower() in ("skip", "s"):
+                _FCC_UNAVAILABLE = True
                 ui.warn("Continuing without the admin panel — the key will be printed so you can add it later.")
                 return None
             ui.info("Retrying the admin panel...")
 
 
 def reuse_or_open_admin(context, admin):
-    """Brings the pre-opened admin tab back and refreshes it, re-opening if it died."""
     if admin is None or admin.is_closed():
         return prompt_fcc_running(context)
     try:
@@ -2142,12 +2488,10 @@ def reuse_or_open_admin(context, admin):
         ui.ok("Admin panel tab refreshed.")
         return admin
     except Exception:
-        ui.warn("The admin tab stopped responding — opening it again.")
         return prompt_fcc_running(context)
 
 
 def _label_field(scope, label):
-    """Finds the input that belongs to a visible field label inside `scope`."""
     try:
         loc = scope.get_by_label(label, exact=True)
         if loc.count():
@@ -2180,11 +2524,9 @@ FCC_EDITOR_TAG_JS = r"""() => {
     };
 
     document.querySelectorAll('[data-fcc-editor]').forEach((el) => el.removeAttribute('data-fcc-editor'));
-
     const fields = [...document.querySelectorAll('input, textarea')].filter(isKeyField);
     if (!fields.length) return null;
 
-    // Smallest ancestor of the last key field that also owns a Save button.
     let node = fields[fields.length - 1];
     let scope = null;
     while (node && node !== document.body) {
@@ -2203,7 +2545,6 @@ FCC_EDITOR_TAG_JS = r"""() => {
 
 
 def _editor_scope(page):
-    """Tags and returns the provider editor container (dialog fallback, then the page)."""
     try:
         page.evaluate(FCC_EDITOR_TAG_JS)
     except Exception:
@@ -2225,7 +2566,6 @@ def _editor_scope(page):
 
 
 def _editor_closed(page):
-    """True once the provider editor is no longer on screen."""
     try:
         tag = page.locator('[data-fcc-editor="1"]')
         if tag.count():
@@ -2239,7 +2579,6 @@ def _editor_closed(page):
 
 
 def _wait_editor_closed(page, seconds):
-    """Polls until the editor disappears or the timeout runs out."""
     deadline = time.time() + max(0.0, seconds)
     while True:
         if _editor_closed(page):
@@ -2250,22 +2589,18 @@ def _wait_editor_closed(page, seconds):
 
 
 def _close_editor(page, seconds=6.0):
-    """Clicks Cancel in the editor and waits for it to go away."""
     try:
         cancel = _editor_button(page, FCC_CANCEL_RE)
         if not cancel.count():
-            ui.warn("No 'Cancel' button in the editor.")
             return False
         cancel.scroll_into_view_if_needed()
         cancel.click(force=True)
-    except Exception as e:
-        ui.warn(f"Cancel click failed ({e.__class__.__name__}).")
+    except Exception:
         return False
     return _wait_editor_closed(page, seconds)
 
 
 def _editor_button(page, pattern):
-    """Finds a button inside the editor first, then anywhere on the page."""
     try:
         scope = _editor_scope(page)
         btn = scope.locator("button:visible").filter(has_text=pattern)
@@ -2279,7 +2614,6 @@ def _editor_button(page, pattern):
 ROW_REMOVE_JS = r"""(node) => {
     let parent = node.parentElement;
     for (let depth = 0; depth < 4 && parent; depth++) {
-        // Stop once the container stops looking like a single row.
         if (parent.querySelectorAll('input, textarea').length > 1) return false;
         const hasRemove = [...parent.querySelectorAll('button')].some((b) => {
             const label = ((b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '')
@@ -2294,7 +2628,6 @@ ROW_REMOVE_JS = r"""(node) => {
 
 
 def _row_has_remove_button(el):
-    """True when this field sits in a row that has its own Remove/Delete button."""
     try:
         return bool(el.evaluate(ROW_REMOVE_JS))
     except Exception:
@@ -2302,7 +2635,6 @@ def _row_has_remove_button(el):
 
 
 def _key_rows(scope):
-    """Visible API-key fields inside the editor, top to bottom."""
     rows = []
     try:
         inputs = scope.locator("input:visible, textarea:visible")
@@ -2324,7 +2656,6 @@ def _key_rows(scope):
         if "key" in ph or "token" in ph or "key" in aria or "key" in name:
             rows.append(el)
         elif _row_has_remove_button(el):
-            # Builds that show the stored key masked inside the field instead of a hint.
             rows.append(el)
     return rows
 
@@ -2344,57 +2675,45 @@ def _row_is_blank(el):
 
 
 def _row_is_configured(el):
-    text = _row_text(el)
-    return "configured" in text or "replace" in text
+    return "configured" in _row_text(el) or "replace" in _row_text(el)
 
 
 def _click_add_key(page, scope):
-    """Clicks 'Add key' inside the editor and waits for a new blank row to appear."""
     before = len(_key_rows(scope))
     add = scope.locator("button:visible").filter(has_text=FCC_ADD_KEY_RE)
     if not add.count():
         add = page.locator("button:visible").filter(has_text=FCC_ADD_KEY_RE)
     if not add.count():
-        ui.warn("No 'Add key' button found in the editor.")
         return None
 
     btn = add.first
     btn.scroll_into_view_if_needed()
-    ui.info("Clicking 'Add key'.")
+    try:
+        btn.click(force=True)
+    except Exception:
+        pass
 
-    for attempt in range(1, 4):
-        try:
-            btn.click(force=True)
-        except Exception as e:
-            ui.warn(f"'Add key' click failed ({e.__class__.__name__}).")
-
-        deadline = time.time() + 5
-        while time.time() < deadline:
-            rows = _key_rows(scope)
-            fresh = [r for r in rows if not _row_is_stored(r)]
-            if len(rows) > before and fresh:
-                ui.ok(f"Key row added ({before} \u2192 {len(rows)}).")
-                return fresh[-1]
-            page.wait_for_timeout(250)
-        ui.warn(f"No new key row after click {attempt}/3.")
-
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        rows = _key_rows(scope)
+        fresh = [r for r in rows if not _row_is_stored(r)]
+        if len(rows) > before and fresh:
+            return fresh[-1]
+        page.wait_for_timeout(250)
     return None
 
 
 def _row_is_stored(el):
-    """A row counts as an existing key if it is marked configured OR already carries a value."""
     if _row_is_configured(el):
         return True
     return not _row_is_blank(el)
 
 
 def _stored_key_count(rows):
-    """How many keys the provider already has (stored rows, not blank entry slots)."""
     return sum(1 for r in rows if _row_is_stored(r))
 
 
 def _type_key_into(page, target, ace_key):
-    """Fills a key row and proves the value survived a re-render."""
     if _row_is_stored(target):
         raise Exception("Refusing to type into a row that already holds a stored key.")
     fill_field(page, target, ace_key, "API key")
@@ -2405,51 +2724,36 @@ def _type_key_into(page, target, ace_key):
         held = ""
     if held != ace_key:
         raise Exception("The key field reset itself after typing.")
-    ui.ok(f"Key verified in the field ({len(held)} chars).")
 
 
 def _set_provider_key(page, ace_key):
-    """Adds the Ace key as a NEW key row — a stored key is never overwritten."""
     scope = _editor_scope(page)
     rows = _key_rows(scope)
     before = _stored_key_count(rows)
-    ui.ok(f"API keys already configured: {before}")
-    ui.info(f"Key fields in the editor right now: {len(rows)} (blank slots: {len(rows) - before}).")
 
     blank = [r for r in rows if not _row_is_stored(r)]
     target = blank[-1] if blank else None
     if target is not None:
-        ui.ok("Using the empty key slot — no stored key is touched.")
+        pass
     else:
-        if before:
-            ui.ok("Every row already holds a stored key — adding a fresh row.")
-        else:
-            ui.info("No key rows yet — adding the first one.")
         target = _click_add_key(page, scope)
 
     if target is not None:
         try:
             _type_key_into(page, target, ace_key)
             return before
-        except Exception as e:
-            ui.warn(str(e))
+        except Exception:
+            pass
 
     added = _click_add_key(page, scope)
     if added is None:
-        path = debug_shot(page, "key-entry")
-        raise Exception(f"The key would not stay in any key field (screenshot: {path}).")
+        raise Exception("The key would not stay in any key field.")
 
-    try:
-        _type_key_into(page, added, ace_key)
-    except Exception as e:
-        path = debug_shot(page, "key-entry")
-        raise Exception(f"{e} (screenshot: {path})")
-
+    _type_key_into(page, added, ace_key)
     return before
 
 
 def _open_provider_editor(page):
-    """Clicks Edit on the ace data cloud card, adding the provider when it is not there yet."""
     if page.evaluate(FCC_FIND_CARD_JS, PROVIDER_NAME):
         card = page.locator('[data-fcc-card="1"]').first
         card.scroll_into_view_if_needed()
@@ -2457,10 +2761,8 @@ def _open_provider_editor(page):
         if not edit.count():
             edit = card.locator("button").filter(has_text=FCC_EDIT_RE).first
         edit.click(force=True)
-        ui.ok("Found the existing 'ace data cloud' provider.")
         return False
 
-    ui.info("No 'ace data cloud' provider yet — adding one.")
     add = page.locator("button:visible").filter(has_text=FCC_ADD_PROVIDER_RE).first
     if not add.count():
         add = page.locator("button").filter(has_text=FCC_ADD_PROVIDER_RE).first
@@ -2471,71 +2773,37 @@ def _open_provider_editor(page):
 
 
 def configure_ace_provider(page, ace_key):
-    """Edits or creates the Ace provider and saves the captured key.
-
-    Returns (saved, keys_before, None); an existing key is never overwritten.
-    """
     is_new = _open_provider_editor(page)
-
-    # The editor animates in; wait for its Save button before poking at fields.
     try:
         page.locator("button:visible").filter(has_text=FCC_SAVE_RE).first.wait_for(
             state="visible", timeout=15000
         )
-    except Exception:
-        path = debug_shot(page, "editor-missing")
-        raise Exception(f"The provider editor did not open (screenshot: {path}).")
+    except Exception as e:
+        raise Exception(f"The provider editor did not open: {e}")
 
     scope = _editor_scope(page)
-
     if is_new:
         fill_field(page, _label_field(scope, "Name"), PROVIDER_NAME, "Provider name")
         fill_field(page, _label_field(scope, "Base URL"), PROVIDER_BASE_URL, "Base URL")
-    else:
-        ui.ok("Using the existing provider entry — only a new key is added.")
 
     ui.step("Enter API key")
     before = _set_provider_key(page, ace_key)
 
     ui.step("Save provider")
     save = _editor_button(page, FCC_SAVE_RE)
-    try:
-        save.scroll_into_view_if_needed()
-        save.click(force=True)
-    except Exception as e:
-        path = debug_shot(page, "save-click")
-        raise Exception(f"Could not click 'Save' ({e.__class__.__name__}; screenshot: {path}).")
+    save.scroll_into_view_if_needed()
+    save.click(force=True)
 
-    ui.info("Save clicked — waiting up to 3s for the editor to auto-close...")
     closed = _wait_editor_closed(page, 3.0)
+    if not closed:
+        _close_editor(page, 6.0)
 
-    if closed:
-        ui.ok("Editor closed on its own.")
-    else:
-        ui.info("Editor stayed open — clicking Cancel to close it.")
-        closed = _close_editor(page, 6.0)
-        if closed:
-            ui.ok("Editor closed with Cancel (the key was already saved).")
-        else:
-            path = debug_shot(page, "provider-save")
-            ui.warn(f"Could not close the provider editor (screenshot: {path}).")
-            return False, before, None
-
-    ui.ok("Provider saved.")
-    # The panel's own "Saved" state is trusted: re-opening the editor to recount
-    # keys is slow and often times out on real installs, so we skip it.
     return True, before, None
 
 
 def apply_pending_changes(page):
-    """Clicks the footer 'Apply' button once it becomes enabled (turns green).
-
-    Only waits 2s: on real installs Save already applies the change, so a
-    greyed-out Apply just means there is nothing left to push.
-    """
     apply_btn = page.locator("button:visible").filter(has_text=FCC_APPLY_RE).last
     if not apply_btn.count():
-        ui.warn("No 'Apply' button at the bottom — nothing to apply.")
         return False
 
     deadline = time.time() + 2
@@ -2548,22 +2816,18 @@ def apply_pending_changes(page):
         page.wait_for_timeout(200)
 
     try:
-        enabled = apply_btn.is_enabled()
+        if not apply_btn.is_enabled():
+            return False
     except Exception:
-        enabled = False
-
-    if not enabled:
-        ui.warn("'Apply' is greyed out — the app reports no pending changes (the key is already stored).")
         return False
 
     apply_btn.scroll_into_view_if_needed()
     apply_btn.click(force=True)
     page.wait_for_timeout(1800)
-    ui.ok("Changes applied.")
     return True
 
+
 def _registration_form_ready(page, timeout=0):
-    """True once the register form (a password field) is on screen."""
     deadline = time.time() + max(0.0, timeout)
     while True:
         try:
@@ -2594,7 +2858,6 @@ REGISTER_TAB_TAG_JS = r"""() => {
         .filter((el) => flat(el.innerText || el.textContent) === 'register' && visible(el));
     if (!hits.length) return null;
 
-    // Prefer a real tab/button over a wrapper div of the same text.
     hits.sort((a, b) => rank(a) - rank(b) || area(a) - area(b));
     const pick = hits[0];
     document.querySelectorAll('[data-fcc-register="1"]').forEach((el) => el.removeAttribute('data-fcc-register'));
@@ -2604,7 +2867,6 @@ REGISTER_TAB_TAG_JS = r"""() => {
 
 
 def _select_register_tab(page):
-    """Clicks the visible 'Register' tab — never a hidden submit button."""
     try:
         if page.evaluate(REGISTER_TAB_TAG_JS):
             tab = page.locator('[data-fcc-register="1"]').first
@@ -2623,7 +2885,6 @@ def _select_register_tab(page):
 
 
 def _goto(page, url, timeout=45000, attempts=2):
-    """Navigates, retrying once so a failed load cannot cancel the next goto."""
     last = None
     for _ in range(max(1, attempts)):
         try:
@@ -2635,12 +2896,10 @@ def _goto(page, url, timeout=45000, attempts=2):
                 page.wait_for_timeout(800)
             except Exception:
                 pass
-    ui.warn(f"Could not open {url} ({last.__class__.__name__}).")
     return False
 
 
 def _docs_register_route(page):
-    """Old path: docs page -> Receive credit -> Apply -> register form."""
     page.wait_for_timeout(1500)
     page.locator('text=/Receive.*Credit|Acquire/i').first.click(timeout=15000)
     page.locator('text=Apply').first.click(timeout=15000)
@@ -2650,7 +2909,6 @@ def _docs_register_route(page):
 
 
 def open_registration(page):
-    """Goes straight to the Ace register page, falling back to the docs route."""
     ui.info(f"Opening {REGISTER_URL} ...")
     if _goto(page, REGISTER_URL):
         page.wait_for_timeout(1500)
@@ -2661,7 +2919,6 @@ def open_registration(page):
         if _registration_form_ready(page, 4):
             ui.ok("Registration form ready.")
             return True
-        ui.warn("The register page showed no form — using the docs route instead.")
 
     _goto(page, TARGET_URL)
     _docs_register_route(page)
@@ -2669,191 +2926,261 @@ def open_registration(page):
     return True
 
 
-def _run():
+def _bootstrap():
+    """Runs once, before any browser opens."""
+    ui.setup_begin([
+        ("Python packages", "checking"),
+        ("Chromium browser", "checking"),
+        ("chromedriver", "checking"),
+        ("Configuration", "reading your settings"),
+        ("Gmail bridge", f"port {BRIDGE_PORT}"),
+    ])
+    for index in range(ui.count):
+        ui.queue_note(index, "waiting for setup")
+    ensure_environment()
+
+    ui.setup_item("Configuration", "busy", "reading assets.txt")
+    base_email = get_base_regular_email()
+    ensure_output_files()
+    ui.setup_item("Configuration", "ok", base_email)
+
     try:
-        ui.phase("BOOTSTRAP")
-        ui.step("Check dependencies")
-        ensure_environment()
+        start_local_server(BRIDGE_PORT)
+        ui.setup_item("Gmail bridge", "ok", f"http://localhost:{BRIDGE_PORT}")
+    except OSError:
+        ui.setup_item("Gmail bridge", "ok", f"http://localhost:{BRIDGE_PORT} (already up)")
 
-        ui.step("Load configuration")
-        base_email = get_base_regular_email()
-        ui.ok(f"Base email: {base_email}")
-        ensure_output_files()
-        ui.detail(f"API keys -> {KEYS_FILE}")
-        ui.detail(f"Recent accounts -> {ACCOUNTS_FILE}")
+    if sync_playwright is None:
+        raise Exception("Playwright is unavailable — run: pip install playwright")
+    ui.setup_end()
+    return base_email
 
-        ui.step("Start Gmail bridge")
+
+def _flow(page, context, index, base_email):
+    """One full Ace -> free-claude-code run, on this instance's pages."""
+    admin = None
+
+    ui.step("Check admin panel")
+    with FCC_LOCK:
+        admin = prompt_fcc_running(context)
+        if admin is not None:
+            ui.ok(f"free-claude-code is up at {FCC_ADMIN_URL}")
+            page.bring_to_front()
+
+    ui.step("Open registration page")
+    page.bring_to_front()
+    open_registration(page)
+
+    ui.step("Request verification code")
+    send_btn = page.locator('input[placeholder*="Verification"] + button, div:has-text("Email Verification Code") button').first
+    if not send_btn.count():
+        send_btn = page.locator('button').filter(has_text=re.compile("Send Email Code|s$", re.IGNORECASE)).first
+    send_btn.wait_for(state="visible", timeout=10000)
+    used_email = submit_email_and_wait_for_success(page, send_btn, base_email)
+    ui.worker_email(index, used_email)
+    ui.ok(f"Verification code sent to {used_email}")
+
+    ui.step("Receive verification code")
+    ui.info("Waiting for local Gmail bridge...")
+    code = wait_for_bridge_code(90)
+    if not code:
+        ui.warn("Bridge timed out waiting for the Gmail verification code.")
+        code = ui.ask("Enter the verification code manually from your inbox:")
+        if not code:
+            raise Exception("Timed out and no manual verification code provided.")
+    ui.ok("Verification code accepted.")
+
+    ui.step("Fill registration form")
+    password = generate_password()
+    page.bring_to_front()
+    page.fill('input[placeholder*="Verification"]', code)
+    page.fill('input[placeholder="Password"]', password)
+    ui.ok("Email code and password filled in.")
+
+    ui.step("Submit registration")
+    if (_captcha_info(page) or {}).get("present"):
+        solve_hcaptcha(page, force=True)
+    ui.info("Submitting registration...")
+    reg_submit = page.locator('form button, .ant-form button, button[type="submit"]').filter(has_text=re.compile("^Register$", re.IGNORECASE)).last
+    if not reg_submit.count():
+        reg_submit = page.locator('.auth-modal button, .card button, div[role="dialog"] button').filter(has_text=re.compile("^Register$", re.IGNORECASE)).last
+    if reg_submit.count():
         try:
-            start_local_server(BRIDGE_PORT)
-            ui.ok(f"Bridge listening on http://localhost:{BRIDGE_PORT}")
-        except OSError as e:
-            ui.warn(f"Port {BRIDGE_PORT} busy — reusing an existing bridge. ({e})")
-        ui.info("Keep the Tampermonkey Gmail tab signed in.")
+            with page.expect_navigation(timeout=15000):
+                reg_submit.click(force=True)
+        except Exception:
+            reg_submit.click(force=True)
+    else:
+        page.click('button:has-text("Register")')
+    ui.ok("Registration submitted.")
 
-        if sync_playwright is None:
-            raise Exception("Playwright is unavailable — run: pip install playwright")
+    ui.step("Open console")
+    page.wait_for_selector("text=Console", timeout=15000)
+    page.click("text=Console")
+    discard_late_codes()
+    ui.ok("Console open.")
 
+    ui.step("Open API key dialog")
+    try:
+        page.wait_for_selector("text=Create API Key", timeout=10000)
+        page.click("text=Create API Key")
+        ui.ok("API key dialog opened.")
+    except Exception:
+        ui.warn("No 'Create API Key' control — using existing console key.")
+    page.wait_for_timeout(2500)
+
+    ui.step("Capture API key")
+    ace_key = grab_ace_api_key(page)
+
+    ui.step("Save key to keys.txt")
+    save_api_key(ace_key)
+
+    # Every instance edits the same provider list, so this part is serialised.
+    with FCC_LOCK:
+        ui.step("Open provider settings")
+        admin = reuse_or_open_admin(context, admin)
+        if admin is None:
+            raise Exception("free-claude-code is not running.")
+
+        configure_ace_provider(admin, ace_key)
+
+        ui.step("Apply changes")
+        apply_pending_changes(admin)
+
+    ui.step("Claim free credit")
+    claim_free_credit(page, select_dedicated=False)
+
+    ui.step("Open Dedicated Balance")
+    select_dedicated_balance(page)
+    return ace_key
+
+
+def _show_traceback():
+    """Prints a traceback without leaving it tangled in the live dashboard."""
+    with ui.lock:
+        ui._erase()
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        ui._paint()
+
+
+def _worker(index, base_email):
+    """Thread entry point: one browser, one instance, one row in the UI."""
+    ui.bind(index)
+    ui.worker_start(index)
+    try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=False)
-            context = browser.new_context()
-            context.grant_permissions(["clipboard-read", "clipboard-write"], origin="https://platform.acedata.cloud")
-            context.grant_permissions(["clipboard-read", "clipboard-write"], origin="http://127.0.0.1:8082")
-            install_captcha_hook(context)
-            page = context.new_page()
-
-            prompt_close = True
-            admin = None
+            # headless=True completely eliminates windows, taskbar icons, and GUI rendering overhead
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled"
+                ]
+            )
             try:
-                ui.step("Check admin panel")
-                admin = prompt_fcc_running(context)
-                if admin is not None:
-                    ui.ok(f"free-claude-code is up at {FCC_ADMIN_URL}")
-                    page.bring_to_front()
+                context = browser.new_context(
+                    viewport={"width": 1920, "height": 1080}
+                )
+                context.grant_permissions(["clipboard-read", "clipboard-write"], origin="https://platform.acedata.cloud")
+                context.grant_permissions(["clipboard-read", "clipboard-write"], origin="http://127.0.0.1:8082")
+                install_captcha_hook(context)
+                page = context.new_page()
 
-                ui.phase("ACE DATA CLOUD")
-                ui.step("Open registration page")
-                page.bring_to_front()
-                open_registration(page)
-
-                ui.step("Request verification code")
-                send_btn = page.locator('input[placeholder*="Verification"] + button, div:has-text("Email Verification Code") button').first
-                if not send_btn.count():
-                    send_btn = page.locator('button').filter(has_text=re.compile("Send Email Code|s$", re.IGNORECASE)).first
-                send_btn.wait_for(state="visible", timeout=10000)
-                used_email = submit_email_and_wait_for_success(page, send_btn, base_email)
-                ui.ok(f"Verification code sent to {used_email}")
-
-                ui.step("Receive verification code")
-                ui.info("Waiting for the local Gmail bridge...")
-                code = wait_for_bridge_code(90)
-                if not code:
-                    raise Exception("Timed out waiting for the Gmail verification code via the local bridge.")
-                ui.ok("Verification code accepted.")
-
-                ui.step("Fill registration form")
-                password = generate_password()
-                page.bring_to_front()
-                page.fill('input[placeholder*="Verification"]', code)
-                page.fill('input[placeholder="Password"]', password)
-                ui.ok("Email code and password filled in.")
-                ui.detail(f"Password used: {password}")
-
-                ui.step("Submit registration")
-                if (_captcha_info(page) or {}).get("present"):
-                    solve_hcaptcha(page, force=True)
-                ui.info("Submitting registration...")
-                reg_submit = page.locator('form button, .ant-form button, button[type="submit"]').filter(has_text=re.compile("^Register$", re.IGNORECASE)).last
-                if not reg_submit.count():
-                    reg_submit = page.locator('.auth-modal button, .card button, div[role="dialog"] button').filter(has_text=re.compile("^Register$", re.IGNORECASE)).last
-                if reg_submit.count():
-                    try:
-                        with page.expect_navigation(timeout=15000):
-                            reg_submit.click(force=True)
-                    except Exception:
-                        reg_submit.click(force=True)
-                else:
-                    ui.warn("Distinct submit button not found — using the general selector.")
-                    page.click('button:has-text("Register")')
-                ui.ok("Registration submitted.")
-
-                ui.step("Open console")
-                page.wait_for_selector("text=Console", timeout=15000)
-                page.click("text=Console")
-                discard_late_codes()
-                ui.ok("Console open.")
-
-                ui.step("Open API key dialog")
-                ui.info("Looking for the API key control...")
-                ui.set_note("create-key 10s")
-                try:
-                    page.wait_for_selector("text=Create API Key", timeout=10000)
-                    page.click("text=Create API Key")
-                    ui.ok("API key dialog opened.")
-                except Exception:
-                    ui.warn("No 'Create API Key' control — using the existing console key.")
-                finally:
-                    ui.set_note("")
-                page.wait_for_timeout(2500)
-
-                ui.step("Capture API key")
-                ace_key = grab_ace_api_key(page)
-
-                ui.step("Save key to keys.txt")
-                save_api_key(ace_key)
-
-                ui.phase("FREE-CLAUDE-CODE")
-                ui.step("Open provider settings")
-                admin = reuse_or_open_admin(context, admin)
-                if admin is None:
-                    raise Exception(
-                        "free-claude-code is not running, so the key could not be stored — "
-                        "it is printed above so you can add it by hand."
-                    )
-
-                saved, keys_before, keys_after = configure_ace_provider(admin, ace_key)
-
-                ui.step("Apply changes")
-                applied = apply_pending_changes(admin)
-
-                ui.phase("ACE DATA CLOUD")
-                ui.step("Claim free credit")
-                claimed = claim_free_credit(page, select_dedicated=False)
-
-                ui.step("Open Dedicated Balance")
-                dedicated = select_dedicated_balance(page)
-
-                ui.stop()
-                if not saved:
-                    return False, (
-                        f"Ace key {ace_key} was captured but the admin panel did not confirm the save — "
-                        "the key is printed above so you can paste it by hand."
-                    )
-
-                if keys_after is not None and keys_after > keys_before:
-                    detail = f"key added ({keys_before} \u2192 {keys_after} keys, existing ones untouched)"
-                elif keys_after is not None and keys_after == keys_before:
-                    detail = f"key count unchanged at {keys_after} — check the panel"
-                else:
-                    detail = f"key added (the {keys_before} existing key(s) were left untouched)"
-
-                credit = " Free credit claimed." if claimed else ""
-                if dedicated:
-                    credit += " Dedicated balance open."
-                if applied:
-                    return True, f"Ace key {ace_key} stored in free-claude-code and applied — {detail}.{credit}"
-                return True, f"Ace key {ace_key} stored in free-claude-code — {detail}.{credit}"
-
-            except KeyboardInterrupt:
-                prompt_close = False
-                ui.stop()
-                return False, "Cancelled by user."
-            except Exception as e:
-                ui.stop()
-                traceback.print_exc()
-                return False, f"{e.__class__.__name__}: {e}"
+                key = _flow(page, context, index, base_email)
+                ui.worker_key(index, key)
+                ui.worker_done(index, True, "key stored in free-claude-code and verified.")
+                return key
             finally:
-                if prompt_close:
-                    try:
-                        ui.ask("Press Enter to close the browser...")
-                    except Exception:
-                        pass
                 try:
                     browser.close()
                 except Exception:
                     pass
-
     except KeyboardInterrupt:
-        ui.stop()
-        return False, "Cancelled by user."
+        ui.worker_done(index, False, "cancelled by user.")
+        return None
     except Exception as e:
-        ui.stop()
-        traceback.print_exc()
-        return False, f"{e.__class__.__name__}: {e}"
+        _show_traceback()
+        ui.worker_done(index, False, f"{e.__class__.__name__}: {e}")
+        return None
+
+
+def ask_instance_count():
+    ui.card("how many browsers?", [
+        "Each browser runs on its own and earns its own API key.",
+        f"Starts are {START_DELAY}s apart, so the Gmail codes never overlap.",
+        f"Type 1-{MAX_INSTANCES}, or just press Enter for 1.",
+    ])
+    while True:
+        answer = ui.ask("How many browsers at once?")
+        if not answer:
+            return 1
+        if answer.isdigit() and 1 <= int(answer) <= MAX_INSTANCES:
+            return int(answer)
+        ui.warn(f"Enter a number between 1 and {MAX_INSTANCES}.")
 
 
 def main():
-    ui.begin(STEPS)
-    success, message = _run()
+    count = ask_instance_count()
+    ui.begin(count, WORKER_STEPS)
+
+    try:
+        base_email = _bootstrap()
+    except KeyboardInterrupt:
+        ui.finish(False, "Cancelled by user.")
+        return
+    except Exception as e:
+        _show_traceback()
+        ui.finish(False, f"{e.__class__.__name__}: {e}")
+        return
+
+    if count > 1:
+        ui.info(f"Setup done — launching {count} browsers, {START_DELAY}s apart.")
+    else:
+        ui.info("Setup done — launching the browser.")
+
+    threads = []
+    launched_at = time.time()
+    try:
+        for index in range(count):
+            if index:
+                target = launched_at + index * START_DELAY
+                while time.time() < target:
+                    ui.queue_note(index, f"starts in {int(round(target - time.time()))}s")
+                    time.sleep(min(0.5, max(0.02, target - time.time())))
+                ui.queue_note(index, "starting now")
+            ui.worker_start(index)
+            thread = threading.Thread(
+                target=_worker,
+                args=(index, base_email),
+                name=f"ace-{index + 1}",
+                daemon=True,
+            )
+            thread.start()
+            threads.append(thread)
+    except KeyboardInterrupt:
+        ui.skip_queued()
+        ui.warn("Stopped launching new instances.")
+
+    try:
+        for thread in threads:
+            # A plain join() would swallow Ctrl-C until every browser finished.
+            while thread.is_alive():
+                thread.join(0.4)
+    except KeyboardInterrupt:
+        ui.warn("Leaving the running instances in the background.")
+
+    done = [w for w in ui.workers if w.status == "done"]
+    failed = [w for w in ui.workers if w.status == "failed"]
+    if threads and done and not failed and len(done) == len(threads):
+        message = f"{len(done)} of {len(threads)} instances produced a key."
+        success = True
+    elif done:
+        message = f"{len(done)} of {max(len(threads), 1)} instances produced a key."
+        success = False
+    else:
+        message = "No keys were produced."
+        success = False
     ui.finish(success, message)
 
 
