@@ -45,7 +45,7 @@ This file stores the local configuration used by the program.
 - we reccomend creating a long email if yours is shorter then 9 charecters
 - enter your email in the assets.txt file
 - enter your Nonecap API key in assets.txt
-- you get 1,300 solves per account
+- you can generate infinite accounts but limited at 10 / ip / hour.
 
 ### 3. Set up Tampermonkey
 
