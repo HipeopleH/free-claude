@@ -6,7 +6,7 @@
 
 ---
 
-**THE APPLICATION IS AT**: https://www.mediafire.com/file/7j8lmgmts5ypf0p/FREE+CLAUDE.exe/file (it was too big to fit in github)
+**I AM CURRENTLY UPDATING AND ADDING NEW METHODS!** You can find these planned changes at the roadmap.md file!
 
 ## Features
 
