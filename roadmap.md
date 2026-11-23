@@ -1,5 +1,7 @@
 I am currently adding support for other providers i can abuse for signups. 
 
+Current most promising **synthorai.io** <- very much like ace data cloud
+
 Able to be automated:
 Puter.js (hard)
 1min.ai (hard)
